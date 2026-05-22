@@ -3,11 +3,24 @@ FROM node:lts-trixie-slim AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 
-# Cache buster to force apt-get to run freshly
-ARG CACHE_BUSTER=1
+# Step A: Update index snapshot
+RUN apt-get update
 
-RUN apt-get update \
-&& apt-get install -y --no-install-recommends ca-certificates gosu curl gh git wget ripgrep python3 passwd uidmap \
+# Step B: Inject random unique hash to forcefully slice the compilation cache window
+ARG BUILD_DATE=2026_05_22_FORCE_REBUILD
+
+# Step C: Fresh uncached processing deployment block
+RUN apt-get install -y --no-install-recommends \
+    ca-certificates \
+    gosu \
+    curl \
+    gh \
+    git \
+    wget \
+    ripgrep \
+    python3 \
+    passwd \
+    uidmap \
 && rm -rf /var/lib/apt/lists/* \
 && corepack enable
 
