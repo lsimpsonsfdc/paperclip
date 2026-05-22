@@ -80,6 +80,10 @@ FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
 WORKDIR /app
+
+# Ensure runtime container shell can locate system binaries like gosu, passwd, and links
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 COPY --chown=node:node --from=build /app /app
 RUN npm install --global --omit=dev @anthropic-ai/claude-code@latest @openai/codex@latest opencode-ai @google/gemini-cli@latest \
   && apt-get update \
