@@ -24,10 +24,13 @@ RUN apt-get install -y --no-install-recommends \
 && rm -rf /var/lib/apt/lists/* \
 && corepack enable
 
+# Fix the Trixie path issue by adding system binary paths to the build environment:
+ENV PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
 # Modify the existing node user/group to have the specified UID/GID to match host user
 RUN usermod -u $USER_UID --non-unique node \
-  && groupmod -g $USER_GID --non-unique node \
-  && usermod -g $USER_GID -d /paperclip node
+&& groupmod -g $USER_GID --non-unique node \
+&& usermod -g $USER_GID -d /paperclip node
 
 FROM base AS deps
 WORKDIR /app
