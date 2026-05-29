@@ -54,6 +54,7 @@ import {
   isClaudeMaxTurnsResult,
   isClaudeTransientUpstreamError,
   isClaudeUnknownSessionError,
+  isClaudeUnrecoverableResumeError,
 } from "./parse.js";
 import { prepareClaudeConfigSeed } from "./claude-config.js";
 import { resolveClaudeDesiredSkillNames } from "./skills.js";
@@ -943,19 +944,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
-    if (
-      sessionId &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
-      initial.parsed &&
-      isClaudeUnknownSessionError(initial.parsed)
-    ) {
-      await onLog(
-        "stdout",
-        `[paperclip] Claude resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
-      );
-      const retry = await runAttempt(null);
-      return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+    if (sessionId && !initial.proc.timedOut && initial.parsed) {
+      const unknownSession =
+        (initial.proc.exitCode ?? 0) !== 0 && isClaudeUnknownSessionError(initial.parsed);
+      // CLI exits 0 on API-error results, so the corrupted-session family must be
+      // detected independently of the exit code (see isClaudeUnrecoverableResumeError).
+      const corruptedSession = isClaudeUnrecoverableResumeError(initial.parsed);
+      if (unknownSession || corruptedSession) {
+        await onLog(
+          "stdout",
+          `[paperclip] Claude resume session "${sessionId}" is unavailable (${corruptedSession ? "corrupted session" : "unknown session"}); retrying with a fresh session.\n`,
+        );
+        const retry = await runAttempt(null);
+        return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+      }
     }
 
     return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });

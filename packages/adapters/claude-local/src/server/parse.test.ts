@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
   isClaudeTransientUpstreamError,
+  isClaudeUnrecoverableResumeError,
 } from "./parse.js";
 
 describe("isClaudeTransientUpstreamError", () => {
@@ -93,6 +94,65 @@ describe("isClaudeTransientUpstreamError", () => {
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
     ).toBe(false);
+  });
+
+  it("does not classify the corrupted-resume 400 as transient", () => {
+    expect(
+      isClaudeTransientUpstreamError({
+        parsed: {
+          is_error: true,
+          api_error_status: 400,
+          result:
+            "API Error: 400 messages.1.content.2: 'thinking' or 'redacted_thinking' blocks in the latest assistant message cannot be modified.",
+        },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeUnrecoverableResumeError", () => {
+  it("returns true for the interleaved thinking-block 400 result", () => {
+    expect(
+      isClaudeUnrecoverableResumeError({
+        is_error: true,
+        api_error_status: 400,
+        result:
+          "API Error: 400 messages.1.content.2: 'thinking' or 'redacted_thinking' blocks in the latest assistant message cannot be modified.",
+      }),
+    ).toBe(true);
+  });
+
+  it("returns true when the signal is only in the errors array", () => {
+    expect(
+      isClaudeUnrecoverableResumeError({
+        api_error_status: 400,
+        errors: [{ message: "messages.0.content.1: redacted_thinking blocks cannot be modified" }],
+      }),
+    ).toBe(true);
+  });
+
+  it("returns false for a healthy result", () => {
+    expect(
+      isClaudeUnrecoverableResumeError({
+        is_error: false,
+        result: "All done.",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for a generic non-400 error", () => {
+    expect(
+      isClaudeUnrecoverableResumeError({
+        is_error: true,
+        api_error_status: 500,
+        result: "API Error: 500 internal server error",
+      }),
+    ).toBe(false);
+  });
+
+  it("returns false for null/undefined input", () => {
+    expect(isClaudeUnrecoverableResumeError(null)).toBe(false);
+    expect(isClaudeUnrecoverableResumeError(undefined)).toBe(false);
   });
 });
 

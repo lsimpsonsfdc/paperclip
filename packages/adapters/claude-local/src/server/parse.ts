@@ -2,6 +2,7 @@ import type { UsageSummary } from "@paperclipai/adapter-utils";
 import {
   asString,
   asNumber,
+  asBoolean,
   parseObject,
   parseJson,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -196,6 +197,29 @@ export function isClaudeUnknownSessionError(parsed: Record<string, unknown>): bo
   );
 }
 
+const CLAUDE_UNRECOVERABLE_RESUME_RE =
+  /blocks in the latest assistant message cannot be modified|redacted_thinking|messages\.\d+\.content/i;
+
+/**
+ * A resumed session can be present in the CLI but internally un-replayable — e.g.
+ * an interleaved-`thinking` block the Anthropic API rejects after a cwd/workspace
+ * relocation. The CLI surfaces this as is_error/api_error_status:400 yet still
+ * exits 0, so detect it from the parsed error signal, not the process exit code.
+ */
+export function isClaudeUnrecoverableResumeError(
+  parsed: Record<string, unknown> | null | undefined,
+): boolean {
+  if (!parsed) return false;
+  const isError = asBoolean(parsed.is_error, false);
+  const apiErrorStatus = asNumber(parsed.api_error_status, 0);
+  if (!isError && apiErrorStatus !== 400) return false;
+  const resultText = asString(parsed.result, "").trim();
+  const allMessages = [resultText, ...extractClaudeErrorMessages(parsed)]
+    .map((msg) => msg.trim())
+    .filter(Boolean);
+  return allMessages.some((msg) => CLAUDE_UNRECOVERABLE_RESUME_RE.test(msg));
+}
+
 function buildClaudeTransientHaystack(input: {
   parsed?: Record<string, unknown> | null;
   stdout?: string | null;
@@ -375,7 +399,8 @@ export function isClaudeTransientUpstreamError(input: {
 }): boolean {
   const parsed = input.parsed ?? null;
   // Deterministic failures are handled by their own classifiers.
-  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed))) {
+  if (parsed && (isClaudeMaxTurnsResult(parsed) || isClaudeUnknownSessionError(parsed)
+      || isClaudeUnrecoverableResumeError(parsed))) {
     return false;
   }
   const loginMeta = detectClaudeLoginRequired({
