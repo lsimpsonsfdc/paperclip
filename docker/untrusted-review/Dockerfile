@@ -3,15 +3,20 @@ FROM node:lts-trixie-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
     bash \
+    build-essential \
     ca-certificates \
+    cmake \
     curl \
     fd-find \
     gh \
     git \
     jq \
     less \
+    ninja-build \
     openssh-client \
     procps \
+    qt6-base-dev \
+    qt6-charts-dev \
     ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
