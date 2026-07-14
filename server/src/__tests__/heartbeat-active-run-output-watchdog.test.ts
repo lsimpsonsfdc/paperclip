@@ -13,6 +13,8 @@ import {
   issueRecoveryActions,
   issueRelations,
   issues,
+  reviewerDispositionRoleSettings,
+  reviewerDispositions,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -639,6 +641,84 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
       .from(heartbeatRunWatchdogDecisions)
       .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
     expect(decisions).toHaveLength(1);
+  });
+
+  // SSO-13507: CISO review of SSO-13493 found this fold called issuesSvc.update(..., {
+  // status: "done" }) directly, bypassing the Reviewer block_done guard entirely. This
+  // fails against the pre-fix code (the evaluation issue silently closes instead of
+  // staying open).
+  it("SSO-13507: the source-resolved fold cannot silently close a block_done evaluation issue", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, managerId, issueId, runId, issuePrefix } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      sourceStatus: "done",
+      sameRunTerminalEvidence: "activity",
+    });
+    const evaluationIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: evaluationIssueId,
+      companyId,
+      title: "Existing stale evaluation",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: managerId,
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+      originKind: "stale_active_run_evaluation",
+      originId: runId,
+      originRunId: runId,
+      originFingerprint: `stale_active_run:${companyId}:${runId}`,
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: evaluationIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      recoveryIssueId: evaluationIssueId,
+      kind: "active_run_watchdog",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "active_run_watchdog",
+      fingerprint: `active-run-watchdog:${companyId}:${runId}:${issueId}`,
+      evidence: { runId },
+      nextAction: "Review stale active run",
+    });
+
+    await db.insert(reviewerDispositionRoleSettings).values({
+      companyId,
+      agentNameKey: "watchdog-blocked-agent",
+      phaseBBlockingEnabled: true,
+      updatedByUserId: null,
+    });
+    await db.insert(reviewerDispositions).values({
+      companyId,
+      issueId: evaluationIssueId,
+      agentNameKey: "watchdog-blocked-agent",
+      disposition: "block_done",
+      failingCheckIds: ["watchdog-block"],
+      checkKind: "[deterministic] blocking",
+      createdByAgentId: null,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    expect(result).toMatchObject({ created: 0, folded: 0, skipped: 1 });
+    const [evaluation] = await db.select().from(issues).where(eq(issues.id, evaluationIssueId));
+    expect(evaluation?.status).toBe("todo");
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(action?.status).toBe("active");
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+    expect(decisions).toHaveLength(0);
   });
 
   it("refuses recovery-on-recovery stale-run recursion", async () => {

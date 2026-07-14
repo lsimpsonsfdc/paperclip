@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -14,6 +15,7 @@ import {
   reviewerDispositionRoleSettings,
   reviewerDispositions,
 } from "@paperclipai/db";
+import { normalizeIssueExecutionPolicy } from "../services/issue-execution-policy.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -278,5 +280,155 @@ describeEmbeddedPostgres("reviewer disposition PATCH guard + override approval",
       failingCheckIds: ["check-6"],
       willBlockDoneTransition: true,
     });
+  });
+
+  // SSO-13507: CISO review of SSO-13493 found the block_done guard was bypassable via
+  // write paths other than the PATCH /issues/:id call site. These regression tests fail
+  // against the pre-fix code (each one goes through a real bypass, not the guarded route).
+
+  it("SSO-13507: a comment auto-approval cannot bypass a block_done disposition", async () => {
+    const fixture = await seedFixture(db);
+    await submitDisposition(fixture, fixture.issues.nmIssue.id, {
+      checkId: "check-comment-bypass",
+      checkKind: "[deterministic] blocking",
+      verdict: "fail",
+      blocking: true,
+    });
+
+    const reviewerAgentId = fixture.agents.nexisMaintainer.agent.id;
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [{ id: randomUUID(), type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+    })!;
+    await db
+      .update(issues)
+      .set({
+        status: "in_review",
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[0]!.id,
+          currentStageIndex: 0,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: reviewerAgentId, userId: null },
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      })
+      .where(eq(issues.id, fixture.issues.nmIssue.id));
+
+    const app = createApp(db, agentActor(reviewerAgentId, fixture.company.id, fixture.agents.nexisMaintainer.runId));
+    const res = await request(app)
+      .post(`/api/issues/${fixture.issues.nmIssue.id}/comments`)
+      .send({ body: "kind: review\ndecision: approved\nsummary: ship it" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+
+    const [reloaded] = await db.select().from(issues).where(eq(issues.id, fixture.issues.nmIssue.id));
+    expect(reloaded!.status).toBe("in_review");
+  });
+
+  it("SSO-13507: rejects a non-board actor linking an override_deterministic_block approval originally granted for a different issue", async () => {
+    const fixture = await seedFixture(db);
+    await submitDisposition(fixture, fixture.issues.nmIssue.id, {
+      checkId: "check-confused-deputy",
+      checkKind: "[deterministic] blocking",
+      verdict: "fail",
+      blocking: true,
+    });
+
+    const boardApp = createApp(db, boardActor(fixture.company.id));
+    const createApproval = await request(boardApp)
+      .post(`/api/companies/${fixture.company.id}/approvals`)
+      .send({
+        type: "override_deterministic_block",
+        payload: { reason: "operator override for a different issue" },
+        issueIds: [fixture.issues.unaffectedIssue.id],
+      });
+    expect(createApproval.status, JSON.stringify(createApproval.body)).toBe(201);
+    const approveRes = await request(boardApp)
+      .post(`/api/approvals/${createApproval.body.id}/approve`)
+      .send({});
+    expect(approveRes.status, JSON.stringify(approveRes.body)).toBe(200);
+
+    // Grant NexisMaintainer (nmIssue's own assignee) enough permission to manage
+    // approval links in general (assertCanManageIssueApprovalLinks) without touching
+    // its role, so this isolates the confused-deputy check from unrelated authorization
+    // boundaries and from the ceo/cto reviewer-disposition role exemption.
+    await db
+      .update(agents)
+      .set({ permissions: { canCreateAgents: true } })
+      .where(eq(agents.id, fixture.agents.nexisMaintainer.agent.id));
+
+    const agentApp = createApp(db, agentActor(fixture.agents.nexisMaintainer.agent.id, fixture.company.id, fixture.agents.nexisMaintainer.runId));
+    const linkRes = await request(agentApp)
+      .post(`/api/issues/${fixture.issues.nmIssue.id}/approvals`)
+      .send({ approvalId: createApproval.body.id });
+    expect(linkRes.status, JSON.stringify(linkRes.body)).toBe(403);
+
+    const patch = await request(agentApp).patch(`/api/issues/${fixture.issues.nmIssue.id}`).send({ status: "done" });
+    expect(patch.status, JSON.stringify(patch.body)).toBe(403);
+  });
+
+  it("SSO-13507: the kill switch is reachable over HTTP and gated to board/CEO actors", async () => {
+    const fixture = await seedFixture(db);
+    await submitDisposition(fixture, fixture.issues.nmIssue.id, {
+      checkId: "check-kill-switch-route",
+      checkKind: "[deterministic] blocking",
+      verdict: "fail",
+      blocking: true,
+    });
+
+    const generalCoderApp = createApp(
+      db,
+      agentActor(fixture.agents.generalCoder.agent.id, fixture.company.id, fixture.agents.generalCoder.runId),
+    );
+    const deniedRes = await request(generalCoderApp)
+      .post(`/api/companies/${fixture.company.id}/reviewer-disposition-settings`)
+      .send({ agentNameKey: "nexismaintainer", phaseBBlockingEnabled: false });
+    expect(deniedRes.status, JSON.stringify(deniedRes.body)).toBe(403);
+
+    const [ceoAgent] = await db
+      .insert(agents)
+      .values({
+        companyId: fixture.company.id,
+        name: "CEO",
+        role: "ceo",
+        adapterType: "process",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })
+      .returning();
+    const [ceoRun] = await db
+      .insert(heartbeatRuns)
+      .values({ companyId: fixture.company.id, agentId: ceoAgent!.id, status: "running" })
+      .returning();
+    const ceoApp = createApp(db, agentActor(ceoAgent!.id, fixture.company.id, ceoRun!.id));
+    const killSwitchRes = await request(ceoApp)
+      .post(`/api/companies/${fixture.company.id}/reviewer-disposition-settings`)
+      .send({ agentNameKey: "nexismaintainer", phaseBBlockingEnabled: false });
+    expect(killSwitchRes.status, JSON.stringify(killSwitchRes.body)).toBe(200);
+
+    const nmApp = createApp(db, agentActor(fixture.agents.nexisMaintainer.agent.id, fixture.company.id, fixture.agents.nexisMaintainer.runId));
+    const patch = await request(nmApp).patch(`/api/issues/${fixture.issues.nmIssue.id}`).send({ status: "done" });
+    expect(patch.status, JSON.stringify(patch.body)).toBe(200);
+  });
+
+  it("SSO-13507: rejects an invalid disposition value at the database layer", async () => {
+    const fixture = await seedFixture(db);
+    await expect(
+      db.insert(reviewerDispositions).values({
+        companyId: fixture.company.id,
+        issueId: fixture.issues.nmIssue.id,
+        agentNameKey: "nexismaintainer",
+        disposition: "not_a_real_disposition",
+        failingCheckIds: [],
+        checkKind: null,
+        createdByAgentId: null,
+      }),
+    ).rejects.toThrow();
   });
 });

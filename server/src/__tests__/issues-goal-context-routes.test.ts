@@ -116,6 +116,15 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => mockHeartbeatService,
   instanceSettingsService: () => mockInstanceSettingsService,
   issueApprovalService: () => ({}),
+  approvalService: () => ({ getById: vi.fn(async () => null) }),
+  reviewerDispositionService: () => ({
+    checkBlockingDispositionForDoneTransition: vi.fn(async () => ({ blocked: false })),
+    getLatestForIssue: vi.fn(async () => null),
+    recordDisposition: vi.fn(async () => ({ disposition: "advisory", row: {} })),
+    setPhaseBBlockingEnabled: vi.fn(async () => ({})),
+    resolvePhaseBBlockingEnabled: vi.fn(async () => false),
+    hasActiveOverrideApproval: vi.fn(async () => false),
+  }),
   issueRecoveryActionService: () => ({
     getActiveForIssue: vi.fn(async () => null),
     listActiveForIssues: vi.fn(async () => new Map()),

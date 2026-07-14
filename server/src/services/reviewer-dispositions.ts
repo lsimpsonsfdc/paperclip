@@ -32,6 +32,73 @@ async function resolvePhaseBBlockingEnabled(db: Db, companyId: string, agentName
   return resolveDefaultPhaseBBlockingEnabled(agentNameKey);
 }
 
+async function getLatestForIssue(db: Db, issueId: string) {
+  return db
+    .select()
+    .from(reviewerDispositions)
+    .where(eq(reviewerDispositions.issueId, issueId))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+}
+
+/**
+ * True when an *approved* override_deterministic_block approval linked to
+ * this issue was decided at/after the disposition's timestamp — i.e. the
+ * override was granted to clear this specific block, not a stale earlier one.
+ */
+async function hasActiveOverrideApproval(db: Db, issueId: string, sinceDecidedAtOrAfter: Date): Promise<boolean> {
+  const [row] = await db
+    .select({ id: approvals.id })
+    .from(issueApprovals)
+    .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+    .where(
+      and(
+        eq(issueApprovals.issueId, issueId),
+        eq(approvals.type, "override_deterministic_block"),
+        eq(approvals.status, "approved"),
+        gte(approvals.decidedAt, sinceDecidedAtOrAfter),
+      ),
+    )
+    .orderBy(desc(approvals.decidedAt))
+    .limit(1);
+  if (!row) return false;
+  return true;
+}
+
+export type ReviewerDispositionTransitionCheck =
+  | { blocked: false }
+  | { blocked: true; disposition: typeof reviewerDispositions.$inferSelect };
+
+/**
+ * SSO-13507: the choke-point version of the block_done check, extracted so it
+ * can be enforced from every write path that can set an issue's status to
+ * "done" (PATCH /issues/:id, the comment auto-approval branch, the recovery
+ * watchdog fold, etc.) instead of living only at one route call site.
+ *
+ * Fail-mode: on a disposition-lookup error, this throws (fail-closed) rather
+ * than silently allowing the transition — see assertNoBlockingReviewerDisposition
+ * in server/src/routes/issues.ts for the full rationale.
+ */
+export async function checkBlockingDispositionForDoneTransition(
+  db: Db,
+  issue: { id: string; companyId: string },
+): Promise<ReviewerDispositionTransitionCheck> {
+  const disposition = await getLatestForIssue(db, issue.id);
+  if (!disposition || disposition.disposition !== "block_done") return { blocked: false };
+
+  // Live re-check (not the value captured at write time) so a CEO-callable
+  // kill-switch flip immediately unblocks issues without needing a per-issue
+  // override approval.
+  const stillEnabled = await resolvePhaseBBlockingEnabled(db, issue.companyId, disposition.agentNameKey);
+  if (!stillEnabled) return { blocked: false };
+
+  if (await hasActiveOverrideApproval(db, issue.id, disposition.updatedAt)) {
+    return { blocked: false };
+  }
+
+  return { blocked: true, disposition };
+}
+
 export function reviewerDispositionService(db: Db) {
   return {
     resolvePhaseBBlockingEnabled: (companyId: string, agentNameKey: string) =>
@@ -69,13 +136,7 @@ export function reviewerDispositionService(db: Db) {
      * Single indexed lookup by issueId (unique index reviewer_dispositions_issue_uq).
      * Used by the PATCH /issues/:id guard on the hot, shared status->done path.
      */
-    getLatestForIssue: async (issueId: string) =>
-      db
-        .select()
-        .from(reviewerDispositions)
-        .where(eq(reviewerDispositions.issueId, issueId))
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
+    getLatestForIssue: (issueId: string) => getLatestForIssue(db, issueId),
 
     /**
      * Compute the disposition via the eval-spec mapper and upsert the single
@@ -135,29 +196,14 @@ export function reviewerDispositionService(db: Db) {
       return { disposition, row };
     },
 
+    hasActiveOverrideApproval: (issueId: string, sinceDecidedAtOrAfter: Date) =>
+      hasActiveOverrideApproval(db, issueId, sinceDecidedAtOrAfter),
+
     /**
-     * True when an *approved* override_deterministic_block approval linked to
-     * this issue was decided at/after the disposition's timestamp — i.e. the
-     * override was granted to clear this specific block, not a stale earlier one.
+     * SSO-13507 choke-point check — see checkBlockingDispositionForDoneTransition.
      */
-    hasActiveOverrideApproval: async (issueId: string, sinceDecidedAtOrAfter: Date): Promise<boolean> => {
-      const [row] = await db
-        .select({ id: approvals.id })
-        .from(issueApprovals)
-        .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
-        .where(
-          and(
-            eq(issueApprovals.issueId, issueId),
-            eq(approvals.type, "override_deterministic_block"),
-            eq(approvals.status, "approved"),
-            gte(approvals.decidedAt, sinceDecidedAtOrAfter),
-          ),
-        )
-        .orderBy(desc(approvals.decidedAt))
-        .limit(1);
-      if (!row) return false;
-      return true;
-    },
+    checkBlockingDispositionForDoneTransition: (issue: { id: string; companyId: string }) =>
+      checkBlockingDispositionForDoneTransition(db, issue),
   };
 }
 
