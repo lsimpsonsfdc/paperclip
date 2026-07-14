@@ -769,6 +769,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           workflowControlledAssignment: true,
         };
       }
+
+      if (
+        (requestedStatus === undefined || requestedStatus === "in_review") &&
+        requestedAssigneePatchProvided &&
+        !principalsEqual(explicitAssignee, currentParticipant)
+      ) {
+        // The active stage participant may hand the issue off to a different assignee
+        // (e.g. DevOps for a merge) without recording a decision or advancing the stage.
+        Object.assign(patch, patchForPrincipal(explicitAssignee));
+        return { patch };
+      }
     }
 
     const attemptedStageAdvance =

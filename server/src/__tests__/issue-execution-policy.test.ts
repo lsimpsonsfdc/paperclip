@@ -7,6 +7,7 @@ const qaAgentId = "22222222-2222-4222-8222-222222222222";
 const ctoAgentId = "33333333-3333-4333-8333-333333333333";
 const ctoUserId = "cto-user";
 const boardUserId = "board-user";
+const devopsAgentId = "44444444-4444-4444-8444-444444444444";
 
 function makePolicy(
   stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,
@@ -381,6 +382,72 @@ describe("issue execution policy transitions", () => {
       });
       // status should NOT be overridden — caller can set done
       expect(result.patch.status).toBeUndefined();
+    });
+
+    it("approver hands off to a different assignee without a status change or decision", () => {
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: approvalStageId,
+            currentStageIndex: 1,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [reviewStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: undefined,
+        requestedAssigneePatch: { assigneeAgentId: devopsAgentId },
+        actor: { userId: ctoUserId },
+      });
+
+      expect(result.patch.assigneeAgentId).toBe(devopsAgentId);
+      expect(result.patch.assigneeUserId).toBeNull();
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.decision).toBeUndefined();
+    });
+
+    it("approver hands off to a different assignee while explicitly staying in_review", () => {
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: approvalStageId,
+            currentStageIndex: 1,
+            currentStageType: "approval",
+            currentParticipant: { type: "user", userId: ctoUserId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [reviewStageId],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: { assigneeAgentId: devopsAgentId },
+        actor: { userId: ctoUserId },
+      });
+
+      expect(result.patch.assigneeAgentId).toBe(devopsAgentId);
+      expect(result.patch.executionState).toBeUndefined();
+      expect(result.decision).toBeUndefined();
     });
   });
 
