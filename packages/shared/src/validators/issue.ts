@@ -1175,6 +1175,15 @@ export const linkIssueApprovalSchema = z.object({
 
 export type LinkIssueApproval = z.infer<typeof linkIssueApprovalSchema>;
 
+export const submitReviewerDispositionSchema = z.object({
+  checkId: z.string().min(1),
+  checkKind: z.string().min(1).optional().nullable(),
+  verdict: z.enum(["pass", "fail"]),
+  blocking: z.boolean(),
+});
+
+export type SubmitReviewerDisposition = z.infer<typeof submitReviewerDispositionSchema>;
+
 export const createIssueAttachmentMetadataSchema = z.object({
   issueCommentId: z.string().uuid().optional().nullable(),
 });

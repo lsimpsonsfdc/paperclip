@@ -46,6 +46,7 @@ import {
   upsertIssueFeedbackVoteSchema,
   upsertIssueWatchdogSchema,
   linkIssueApprovalSchema,
+  submitReviewerDispositionSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
@@ -62,6 +63,7 @@ import {
   isClosedIsolatedExecutionWorkspace,
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
+  normalizeAgentUrlKey,
   type CompactIssue,
   type CompanySearchQuery,
   type CompanySearchResponse,
@@ -102,6 +104,7 @@ import {
   heartbeatService,
   issueApprovalService,
   issueRecoveryActionService,
+  reviewerDispositionService,
   issueThreadInteractionService,
   ISSUE_LIST_DEFAULT_LIMIT,
   ISSUE_LIST_MAX_LIMIT,
@@ -2577,6 +2580,7 @@ export function issueRoutes(
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
+  const reviewerDispositionSvc = reviewerDispositionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
   const workProductsSvc = workProductService(db);
   const documentsSvc = documentService(db);
@@ -4194,6 +4198,55 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * SSO-13493 Phase B: blocks a status->done transition when the issue carries a
+   * `block_done` Reviewer disposition (a `[deterministic] blocking` FAIL) and that
+   * disposition's role is currently phase_b_blocking_enabled for this company.
+   *
+   * Fail-mode: on a disposition-lookup error, this throws (fail-closed) rather than
+   * silently allowing the transition. Blast radius is narrow — only issues that
+   * already have a `block_done` row for a flagged-on role are affected by a lookup
+   * failure denying a legitimate close; every other PATCH on this shared, multi-tenant
+   * endpoint is unaffected because the lookup only runs when updateFields.status
+   * === "done". The fail-open alternative (allow on lookup error) was rejected
+   * because it would silently defeat the guard's entire purpose during an outage.
+   */
+  async function assertNoBlockingReviewerDisposition(
+    req: Request,
+    res: Response,
+    issue: { id: string; companyId: string },
+  ) {
+    const disposition = await reviewerDispositionSvc.getLatestForIssue(issue.id);
+    if (!disposition || disposition.disposition !== "block_done") return true;
+
+    // Live re-check (not the value captured at write time) so a CEO-callable
+    // kill-switch flip immediately unblocks issues without needing a per-issue
+    // override approval.
+    const stillEnabled = await reviewerDispositionSvc.resolvePhaseBBlockingEnabled(
+      issue.companyId,
+      disposition.agentNameKey,
+    );
+    if (!stillEnabled) return true;
+
+    if (await reviewerDispositionSvc.hasActiveOverrideApproval(issue.id, disposition.updatedAt)) {
+      return true;
+    }
+
+    res.status(403).json({
+      error: "Blocked by a Reviewer deterministic-blocking disposition",
+      failingCheckId: disposition.failingCheckIds,
+      details: {
+        issueId: issue.id,
+        disposition: disposition.disposition,
+        agentNameKey: disposition.agentNameKey,
+        checkKind: disposition.checkKind,
+        failingCheckIds: disposition.failingCheckIds,
+        bypass: "Request an override_deterministic_block approval linked to this issue (board-only).",
+      },
+    });
+    return false;
+  }
+
   async function resolveActiveIssueRun(issue: {
     id: string;
     assigneeAgentId: string | null;
@@ -5033,6 +5086,7 @@ export function issueRoutes(
       continuationSummary,
       currentExecutionWorkspace,
       activeRecoveryAction,
+      latestReviewerDisposition,
     ] =
       await Promise.all([
         resolveIssueProjectAndGoal(issue),
@@ -5047,7 +5101,33 @@ export function issueRoutes(
         documentsSvc.getIssueDocumentByKey(issue.id, ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY),
         currentExecutionWorkspacePromise,
         recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id),
+        reviewerDispositionSvc.getLatestForIssue(issue.id),
       ]);
+    // SSO-13493: surface the current would-block state so a blocked agent can
+    // iterate/escalate instead of retry-looping on a silent 403. Mirrors the
+    // PATCH /issues/:id guard's own re-check (live flag + override approval),
+    // not just the disposition value captured at write time.
+    const reviewerDispositionContext = await (async () => {
+      if (!latestReviewerDisposition) return null;
+      const isBlockDone = latestReviewerDisposition.disposition === "block_done";
+      const stillEnabled = isBlockDone
+        ? await reviewerDispositionSvc.resolvePhaseBBlockingEnabled(
+            issue.companyId,
+            latestReviewerDisposition.agentNameKey,
+          )
+        : false;
+      const hasOverride = isBlockDone && stillEnabled
+        ? await reviewerDispositionSvc.hasActiveOverrideApproval(issue.id, latestReviewerDisposition.updatedAt)
+        : false;
+      return {
+        disposition: latestReviewerDisposition.disposition,
+        agentNameKey: latestReviewerDisposition.agentNameKey,
+        checkKind: latestReviewerDisposition.checkKind,
+        failingCheckIds: latestReviewerDisposition.failingCheckIds,
+        updatedAt: latestReviewerDisposition.updatedAt,
+        willBlockDoneTransition: isBlockDone && stillEnabled && !hasOverride,
+      };
+    })();
     const recoveryActionsByRelationIssue = await relationRecoveryActionMap(
       recoveryActionsSvc,
       issue.companyId,
@@ -5105,6 +5185,7 @@ export function issueRoutes(
         originKind: issue.originKind,
         originId: issue.originId,
         updatedAt: issue.updatedAt,
+        reviewerDisposition: reviewerDispositionContext,
       },
       ancestors: ancestors.map((ancestor) => ({
         id: ancestor.id,
@@ -6944,6 +7025,73 @@ export function issueRoutes(
     res.json({ ok: true });
   });
 
+  // SSO-13493 Phase B: structured Reviewer disposition intake. Persists to
+  // reviewer_dispositions instead of parsing free-text comments so the PATCH
+  // /issues/:id guard can do a single indexed lookup on the hot, shared path.
+  // The submitting actor (the Reviewer) is deliberately not required to be the
+  // issue's assignee — Reviewer evaluates other agents' work.
+  router.post(
+    "/issues/:id/reviewer-dispositions",
+    validate(submitReviewerDispositionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+      if (req.actor.type !== "agent") {
+        res.status(403).json({ error: "Only agents can submit Reviewer dispositions" });
+        return;
+      }
+      if (!issue.assigneeAgentId) {
+        res.status(422).json({ error: "Issue has no assignee to compute a disposition for" });
+        return;
+      }
+      const reviewedAgent = await agentsSvc.getById(issue.assigneeAgentId);
+      if (!reviewedAgent) {
+        res.status(422).json({ error: "Issue assignee agent not found" });
+        return;
+      }
+      const agentNameKey = normalizeAgentUrlKey(reviewedAgent.name) ?? reviewedAgent.id;
+
+      const actor = getActorInfo(req);
+      const { disposition, row } = await reviewerDispositionSvc.recordDisposition({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentNameKey,
+        agentRole: reviewedAgent.role,
+        verdict: req.body.verdict,
+        blocking: req.body.blocking,
+        failingCheckIds: req.body.verdict === "fail" ? [req.body.checkId] : [],
+        checkKind: req.body.checkKind ?? null,
+        createdByAgentId: actor.agentId,
+      });
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.reviewer_disposition_recorded",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          disposition,
+          agentNameKey,
+          checkId: req.body.checkId,
+          checkKind: req.body.checkKind ?? null,
+          verdict: req.body.verdict,
+          blocking: req.body.blocking,
+        },
+      });
+
+      res.status(201).json(row);
+    },
+  );
+
   router.post("/companies/:companyId/issues", applyCreateIssueStatusDefault, validate(createIssueSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
@@ -7893,6 +8041,10 @@ export function issueRoutes(
       updateFields,
       actorType: req.actor.type,
     });
+
+    if (updateFields.status === "done") {
+      if (!(await assertNoBlockingReviewerDisposition(req, res, existing))) return;
+    }
 
     const nextAssigneeAgentId =
       updateFields.assigneeAgentId === undefined ? existing.assigneeAgentId : (updateFields.assigneeAgentId as string | null);

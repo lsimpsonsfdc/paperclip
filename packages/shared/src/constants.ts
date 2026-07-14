@@ -60,6 +60,16 @@ export const AGENT_ROLES = [
 ] as const;
 export type AgentRole = (typeof AGENT_ROLES)[number];
 
+/**
+ * Executive agent roles whose Reviewer disposition always stays "advisory" —
+ * never gated by phase_b_blocking_enabled, never flippable by any flag.
+ * @see reviewer-disposition.ts mapReviewerDisposition
+ */
+export const REVIEWER_DISPOSITION_EXEMPT_AGENT_ROLES = ["ceo", "cto"] as const;
+
+export const REVIEWER_DISPOSITIONS = ["block_done", "advisory"] as const;
+export type ReviewerDisposition = (typeof REVIEWER_DISPOSITIONS)[number];
+
 export const AGENT_ROLE_LABELS: Record<AgentRole, string> = {
   ceo: "CEO",
   cto: "CTO",
@@ -595,6 +605,7 @@ export const APPROVAL_TYPES = [
   "approve_ceo_strategy",
   "budget_override_required",
   "request_board_approval",
+  "override_deterministic_block",
 ] as const;
 export type ApprovalType = (typeof APPROVAL_TYPES)[number];
 

@@ -241,6 +241,8 @@ export {
   PROJECT_COLORS,
   APPROVAL_TYPES,
   APPROVAL_STATUSES,
+  REVIEWER_DISPOSITIONS,
+  REVIEWER_DISPOSITION_EXEMPT_AGENT_ROLES,
   SECRET_PROVIDERS,
   SECRET_PROVIDER_CONFIG_STATUSES,
   SECRET_PROVIDER_CONFIG_HEALTH_STATUSES,
@@ -417,6 +419,7 @@ export {
   type PauseReason,
   type ApprovalType,
   type ApprovalStatus,
+  type ReviewerDisposition,
   type SecretProvider,
   type SecretProviderConfigStatus,
   type SecretProviderConfigHealthStatus,
@@ -1529,6 +1532,7 @@ export {
   respondIssueThreadInteractionSchema,
   submitIssueThreadInteractionVerdictsSchema,
   linkIssueApprovalSchema,
+  submitReviewerDispositionSchema,
   createIssueAttachmentMetadataSchema,
   createIssueWorkProductSchema,
   issueWorkProductMetadataSchema,
@@ -1591,6 +1595,7 @@ export {
   type RespondIssueThreadInteraction,
   type SubmitIssueThreadInteractionVerdicts,
   type LinkIssueApproval,
+  type SubmitReviewerDisposition,
   type CreateIssueAttachmentMetadata,
   type CreateIssueWorkProduct,
   type UpdateIssueWorkProduct,
@@ -1983,6 +1988,12 @@ export {
 
 export { API_PREFIX, API } from "./api.js";
 export { normalizeAgentUrlKey, deriveAgentUrlKey, isUuidLike } from "./agent-url-key.js";
+export {
+  mapReviewerDisposition,
+  resolveDefaultPhaseBBlockingEnabled,
+  DEFAULT_PHASE_B_BLOCKING_ENABLED,
+  type MapReviewerDispositionInput,
+} from "./reviewer-disposition.js";
 export { deriveProjectUrlKey, normalizeProjectUrlKey, hasNonAsciiContent } from "./project-url-key.js";
 export {
   AGENT_MENTION_SCHEME,

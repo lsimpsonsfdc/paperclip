@@ -130,6 +130,15 @@ export function approvalRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, companyId))) return;
+    if (req.body.type === "override_deterministic_block" && req.actor.type !== "board") {
+      // SSO-13493: bypassing a Reviewer block_done disposition is operator-only,
+      // never agent-self-service — unlike other approval types, agents may not
+      // even create a pending request of this type.
+      res.status(403).json({
+        error: "Only board users can create override_deterministic_block approvals",
+      });
+      return;
+    }
     const rawIssueIds = req.body.issueIds;
     const issueIds = Array.isArray(rawIssueIds)
       ? rawIssueIds.filter((value: unknown): value is string => typeof value === "string")
