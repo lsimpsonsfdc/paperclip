@@ -143,6 +143,7 @@ import {
 import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { withWorkspaceProvisionLock } from "./workspace-provision-lock.js";
 import {
   redactCurrentUserText,
   redactCurrentUserValue,
@@ -615,50 +616,55 @@ async function ensureManagedProjectWorkspace(input: {
   projectId: string;
   repoUrl: string | null;
 }): Promise<{ cwd: string; warning: string | null }> {
-  const cwd = resolveManagedProjectWorkspaceDir({
-    companyId: input.companyId,
-    projectId: input.projectId,
-    repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
-  });
-  await fs.mkdir(path.dirname(cwd), { recursive: true });
-  const stats = await fs.stat(cwd).catch(() => null);
-
-  if (!input.repoUrl) {
-    if (!stats) {
-      await fs.mkdir(cwd, { recursive: true });
-    }
-    return { cwd, warning: null };
-  }
-
-  const gitDirExists = await fs
-    .stat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory())
-    .catch(() => false);
-  if (gitDirExists) {
-    return { cwd, warning: null };
-  }
-
-  if (stats) {
-    const entries = await fs.readdir(cwd).catch(() => []);
-    if (entries.length > 0) {
-      return {
-        cwd,
-        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
-      };
-    }
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
-
-  try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
-      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+  // Advisory lock as defense-in-depth for the provisioning window itself
+  // (clone/branch-setup). It cannot prevent an agent's own shell from later
+  // mutating the shared checkout mid-run — see SSO-13621.
+  return withWorkspaceProvisionLock(`${input.companyId}:${input.projectId}`, async () => {
+    const cwd = resolveManagedProjectWorkspaceDir({
+      companyId: input.companyId,
+      projectId: input.projectId,
+      repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
     });
-    return { cwd, warning: null };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
-  }
+    await fs.mkdir(path.dirname(cwd), { recursive: true });
+    const stats = await fs.stat(cwd).catch(() => null);
+
+    if (!input.repoUrl) {
+      if (!stats) {
+        await fs.mkdir(cwd, { recursive: true });
+      }
+      return { cwd, warning: null };
+    }
+
+    const gitDirExists = await fs
+      .stat(path.resolve(cwd, ".git"))
+      .then((entry) => entry.isDirectory())
+      .catch(() => false);
+    if (gitDirExists) {
+      return { cwd, warning: null };
+    }
+
+    if (stats) {
+      const entries = await fs.readdir(cwd).catch(() => []);
+      if (entries.length > 0) {
+        return {
+          cwd,
+          warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
+        };
+      }
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+
+    try {
+      await execFile("git", ["clone", input.repoUrl, cwd], {
+        env: sanitizeRuntimeServiceBaseEnv(process.env),
+        timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+      });
+      return { cwd, warning: null };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+    }
+  });
 }
 
 const heartbeatRunProcessGroupIdColumn =
@@ -6797,9 +6803,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .where(and(eq(projects.id, executionProjectId), eq(projects.companyId, agent.companyId)))
           .then((rows) => rows[0] ?? null)
       : null;
+    const agentMaxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
       parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
       isolatedWorkspacesEnabled,
+      agentMaxConcurrentRuns,
     );
     const taskSession = taskKey
       ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
@@ -6824,6 +6832,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      maxConcurrentRuns: agentMaxConcurrentRuns,
     });
     const resolvedWorkspace = await resolveWorkspaceForRun(
       agent,
@@ -7043,6 +7052,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             name: agent.name,
             companyId: agent.companyId,
           },
+          run: { id: run.id },
           recorder: workspaceOperationRecorder,
         });
     const resolvedProjectId = executionWorkspace.projectId ?? issueRef?.projectId ?? executionProjectId ?? null;

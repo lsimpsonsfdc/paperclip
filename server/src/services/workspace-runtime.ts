@@ -60,6 +60,10 @@ export interface ExecutionWorkspaceAgentRef {
   companyId: string;
 }
 
+export interface ExecutionWorkspaceRunRef {
+  id: string;
+}
+
 export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   strategy: "project_primary" | "git_worktree";
   cwd: string;
@@ -368,6 +372,7 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
 function renderWorkspaceTemplate(template: string, input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  run: ExecutionWorkspaceRunRef | null;
   projectId: string | null;
   repoRef: string | null;
 }) {
@@ -382,6 +387,9 @@ function renderWorkspaceTemplate(template: string, input: {
     agent: {
       id: input.agent.id ?? "",
       name: input.agent.name,
+    },
+    run: {
+      id: input.run?.id ?? "",
     },
     project: {
       id: input.projectId ?? "",
@@ -990,6 +998,7 @@ export async function realizeExecutionWorkspace(input: {
   config: Record<string, unknown>;
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  run?: ExecutionWorkspaceRunRef | null;
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
@@ -1007,10 +1016,14 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
-  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
+  // Key the default branch/path by run, not just issue+slug — two concurrent
+  // runs on the same issue (re-checkout, retry, etc.) would otherwise compute
+  // the same worktree path and collide (SSO-13618/SSO-13621).
+  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}-{{run.id}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
     issue: input.issue,
     agent: input.agent,
+    run: input.run ?? null,
     projectId: input.base.projectId,
     repoRef: input.base.repoRef,
   });
