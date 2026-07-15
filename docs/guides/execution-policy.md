@@ -115,7 +115,7 @@ interface IssueExecutionDecision {
 └───────────┘                       └──────────────┘               └───────────┘
 ```
 
-1. **Reviewer requests changes** by transitioning to any status other than `done` (typically `in_progress`), with a comment explaining what needs to change.
+1. **Reviewer requests changes** by transitioning to `in_progress`, with a comment explaining what needs to change. This is the only status the runtime accepts as a changes-requested decision — any other non-`done`/non-`in_review` status is rejected with a `422` naming the two valid actions (`done` to approve, `in_progress` to request changes), so a stray status can never silently become a formal decision.
 2. Runtime automatically:
    - Sets status to `in_progress`
    - Reassigns to the original executor (stored in `returnAssignee`)
@@ -173,6 +173,7 @@ This prevents silent completions where an agent finishes work but leaves no trac
 - Only the **active reviewer/approver** (the `currentParticipant` in execution state) can advance or reject the current stage.
 - Non-participants who attempt to transition the issue receive a `422 Unprocessable Entity` error.
 - Both approvals and change requests **require a comment** — empty or whitespace-only comments are rejected.
+- The active reviewer/approver has exactly two valid decisions: `status: "done"` (approve) or `status: "in_progress"` (request changes). Any other status value is rejected with a `422` naming both valid actions — it can never be silently recorded as a formal decision.
 
 ## API Usage
 
@@ -233,7 +234,7 @@ The runtime determines whether this completes the workflow or advances to the ne
 
 ### Requesting changes
 
-The active reviewer transitions to any non-`done` status with a comment:
+The active reviewer transitions to `in_progress` with a comment:
 
 ```bash
 PATCH /api/issues/{issueId}
@@ -243,7 +244,7 @@ PATCH /api/issues/{issueId}
 }
 ```
 
-The runtime reassigns to the original executor automatically.
+The runtime reassigns to the original executor automatically. Any other non-`done`/non-`in_review` status submitted by the active reviewer/approver (e.g. `blocked`, `todo`) is rejected with a `422` — it is never silently recorded as a `changes_requested` decision.
 
 ## UI
 
