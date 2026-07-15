@@ -391,4 +391,37 @@ describe("execution workspace policy helpers", () => {
       }),
     ).toBe("agent_default");
   });
+
+  it("does not force isolation via resolveExecutionWorkspaceMode when the isolated-workspaces instance flag is off", () => {
+    // The instance-level flag is the master switch for the whole isolated-workspaces
+    // subsystem — the concurrency guard must not bypass it (SSO-13621 CI fix).
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+        isolatedWorkspacesEnabled: false,
+      }),
+    ).toBe("shared_workspace");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+        isolatedWorkspacesEnabled: false,
+      }),
+    ).toBe("shared_workspace");
+
+    // Omitting the flag preserves the existing forcing behavior (defaults to enabled).
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+      }),
+    ).toBe("isolated_workspace");
+  });
 });

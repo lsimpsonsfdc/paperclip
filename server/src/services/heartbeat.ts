@@ -6833,6 +6833,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
       maxConcurrentRuns: agentMaxConcurrentRuns,
+      isolatedWorkspacesEnabled,
     });
     const resolvedWorkspace = await resolveWorkspaceForRun(
       agent,
@@ -7084,9 +7085,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
+              // Reflect what was actually realized, not merely requested — an
+              // isolated_workspace request degrades to a shared checkout when
+              // realizeExecutionWorkspace couldn't honor git_worktree (e.g. the
+              // workspace isn't backed by a git repo at all) (SSO-13621).
               mode:
                 requestedExecutionWorkspaceMode === "isolated_workspace"
-                  ? "isolated_workspace"
+                  ? (executionWorkspace.strategy === "git_worktree" ? "isolated_workspace" : "shared_workspace")
                   : requestedExecutionWorkspaceMode === "operator_branch"
                     ? "operator_branch"
                     : requestedExecutionWorkspaceMode === "agent_default"

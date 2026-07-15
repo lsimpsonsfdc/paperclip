@@ -418,6 +418,46 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.stat(path.join(runB.cwd, ".git"))).resolves.toBeTruthy();
   });
 
+  it("degrades to project_primary instead of throwing when git_worktree is requested for a non-git-backed workspace (SSO-13621)", async () => {
+    const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-non-git-"));
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: plainDir,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-901",
+        title: "Non Git Backed Workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      run: { id: "run-cccc" },
+    });
+
+    expect(workspace.strategy).toBe("project_primary");
+    expect(workspace.created).toBe(false);
+    expect(workspace.cwd).toBe(plainDir);
+    expect(workspace.branchName).toBeNull();
+    expect(workspace.worktreePath).toBeNull();
+    expect(workspace.warnings).toEqual([
+      expect.stringContaining("is not a git checkout"),
+    ]);
+  });
+
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";

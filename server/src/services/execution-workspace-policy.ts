@@ -196,6 +196,7 @@ export function resolveExecutionWorkspaceMode(input: {
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
   maxConcurrentRuns?: number;
+  isolatedWorkspacesEnabled?: boolean;
 }): ParsedExecutionWorkspaceMode {
   const resolved = ((): ParsedExecutionWorkspaceMode => {
     const issueMode = input.issueSettings?.mode;
@@ -216,8 +217,14 @@ export function resolveExecutionWorkspaceMode(input: {
 
   // Defense-in-depth: even if an issue-level override explicitly requests
   // shared_workspace, never hand out a shared checkout when more than one
-  // run can execute concurrently for this agent (SSO-13618).
-  if (resolved === "shared_workspace" && (input.maxConcurrentRuns ?? 1) > 1) {
+  // run can execute concurrently for this agent (SSO-13618). Gated on the
+  // instance-level isolated-workspaces flag, same as gateProjectExecutionWorkspacePolicy
+  // — this is not the switch that decides whether isolation is available at all.
+  if (
+    resolved === "shared_workspace" &&
+    (input.isolatedWorkspacesEnabled ?? true) &&
+    (input.maxConcurrentRuns ?? 1) > 1
+  ) {
     return "isolated_workspace";
   }
   return resolved;

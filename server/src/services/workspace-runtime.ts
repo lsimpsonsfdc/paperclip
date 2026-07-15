@@ -1015,6 +1015,24 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
+  // A workspace that isn't backed by a git checkout at all (e.g. a plain
+  // scratch directory with no repoUrl) can't be worktree-isolated — there's
+  // no repo to branch off, and running git against it would just throw.
+  // Degrade to project_primary instead of failing the run (SSO-13621).
+  if (!(await isGitCheckout(input.base.baseCwd))) {
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: input.base.baseCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        `Workspace at "${input.base.baseCwd}" is not a git checkout; skipping git_worktree strategy and using it as-is.`,
+      ],
+      created: false,
+    };
+  }
+
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
   // Key the default branch/path by run, not just issue+slug — two concurrent
   // runs on the same issue (re-checkout, retry, etc.) would otherwise compute
