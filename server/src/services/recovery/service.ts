@@ -857,22 +857,46 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
     if (issue.monitorNextCheckAt) return true;
 
-    return db
-      .select({ id: issueRelations.issueId })
-      .from(issueRelations)
-      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
-      .where(
-        and(
-          eq(issueRelations.companyId, issue.companyId),
-          eq(issueRelations.relatedIssueId, issue.id),
-          eq(issueRelations.type, "blocks"),
-          eq(issues.companyId, issue.companyId),
-          notInArray(issues.status, ["done", "cancelled"]),
-          isNull(issues.hiddenAt),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
+    const [liveBlocker, liveChild] = await Promise.all([
+      db
+        .select({ id: issueRelations.issueId })
+        .from(issueRelations)
+        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+        .where(
+          and(
+            eq(issueRelations.companyId, issue.companyId),
+            eq(issueRelations.relatedIssueId, issue.id),
+            eq(issueRelations.type, "blocks"),
+            eq(issues.companyId, issue.companyId),
+            notInArray(issues.status, ["done", "cancelled"]),
+            isNull(issues.hiddenAt),
+          ),
+        )
+        .limit(1)
+        .then((rows) => Boolean(rows[0])),
+      // An `in_progress` tracking/epic parent waiting on live children is a
+      // valid disposition: the `issue_children_completed` wake re-invokes the
+      // assignee once every child reaches a terminal status. Scoped to
+      // `in_progress` so live children never suppress `in_review` participant
+      // recovery, which children do not gate.
+      issue.status === "in_progress"
+        ? db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, issue.companyId),
+              eq(issues.parentId, issue.id),
+              notInArray(issues.status, ["done", "cancelled"]),
+              isNull(issues.hiddenAt),
+            ),
+          )
+          .limit(1)
+          .then((rows) => Boolean(rows[0]))
+        : Promise.resolve(false),
+    ]);
+
+    return liveBlocker || liveChild;
   }
 
   async function hasQueuedIssueWake(companyId: string, issueId: string, agentId?: string | null) {

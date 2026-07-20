@@ -95,6 +95,7 @@ const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue already has a queued or deferred wake",
   "pending interaction or approval owns the next action",
   "persisted issue monitor owns the next action",
+  "live child issues own the continuation path",
   "explicit blocker path owns the next action",
   "open recovery issue owns the ambiguity",
   "issue is under an active pause hold",
@@ -370,6 +371,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasQueuedWake: boolean;
   hasPendingInteractionOrApproval: boolean;
   hasPersistedMonitor: boolean;
+  hasLiveNonTerminalChildren: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
@@ -412,6 +414,12 @@ export function decideSuccessfulRunHandoff(input: {
     return { kind: "skip", reason: "pending interaction or approval owns the next action" };
   }
   if (input.hasPersistedMonitor) return { kind: "skip", reason: "persisted issue monitor owns the next action" };
+  if (input.hasLiveNonTerminalChildren) {
+    // Tracking/epic parents wait in `in_progress` with no self-blockers; the
+    // `issue_children_completed` wake fires once every child reaches a terminal
+    // status, so that wake is the continuation path.
+    return { kind: "skip", reason: "live child issues own the continuation path" };
+  }
   if (input.hasExplicitBlockerPath) return { kind: "skip", reason: "explicit blocker path owns the next action" };
   if (input.hasOpenRecoveryIssue) return { kind: "skip", reason: "open recovery issue owns the ambiguity" };
   if (input.hasPauseHold) return { kind: "skip", reason: "issue is under an active pause hold" };
