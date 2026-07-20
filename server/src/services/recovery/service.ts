@@ -423,6 +423,22 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(run || deferredWake);
   }
 
+  async function hasLiveNonTerminalChildren(companyId: string, issueId: string) {
+    return db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.parentId, issueId),
+          notInArray(issues.status, ["done", "cancelled"]),
+          isNull(issues.hiddenAt),
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function hasQueuedIssueWake(companyId: string, issueId: string) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1854,6 +1870,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
+        result.skipped += 1;
+        continue;
+      }
+      // An `in_progress` tracking/epic parent whose latest run succeeded and
+      // that still has live non-terminal children is in a valid waiting state:
+      // the `issue_children_completed` wake re-invokes the assignee once every
+      // child reaches a terminal status (SSO-15401). Skip both the exhausted
+      // corrective-handoff escalation and continuation requeues for it.
+      if (latestRun?.status === "succeeded" && await hasLiveNonTerminalChildren(issue.companyId, issue.id)) {
         result.skipped += 1;
         continue;
       }
