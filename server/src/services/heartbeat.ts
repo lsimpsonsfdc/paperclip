@@ -208,6 +208,7 @@ import { recoveryService } from "./recovery/service.js";
 import { productivityReviewService } from "./productivity-review.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
 import { withAgentStartLock } from "./agent-start-lock.js";
+import { withWorkspaceProvisionLock } from "./workspace-provision-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -1301,50 +1302,55 @@ async function ensureManagedProjectWorkspace(input: {
   projectId: string;
   repoUrl: string | null;
 }): Promise<{ cwd: string; warning: string | null }> {
-  const cwd = resolveManagedProjectWorkspaceDir({
-    companyId: input.companyId,
-    projectId: input.projectId,
-    repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
-  });
-  await fs.mkdir(path.dirname(cwd), { recursive: true });
-  const stats = await fs.stat(cwd).catch(() => null);
-
-  if (!input.repoUrl) {
-    if (!stats) {
-      await fs.mkdir(cwd, { recursive: true });
-    }
-    return { cwd, warning: null };
-  }
-
-  const gitDirExists = await fs
-    .stat(path.resolve(cwd, ".git"))
-    .then((entry) => entry.isDirectory())
-    .catch(() => false);
-  if (gitDirExists) {
-    return { cwd, warning: null };
-  }
-
-  if (stats) {
-    const entries = await fs.readdir(cwd).catch(() => []);
-    if (entries.length > 0) {
-      return {
-        cwd,
-        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
-      };
-    }
-    await fs.rm(cwd, { recursive: true, force: true });
-  }
-
-  try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
-      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+  // Advisory lock as defense-in-depth for the provisioning window itself
+  // (clone/branch-setup). It cannot prevent an agent's own shell from later
+  // mutating the shared checkout mid-run — see SSO-13621.
+  return withWorkspaceProvisionLock(`${input.companyId}:${input.projectId}`, async () => {
+    const cwd = resolveManagedProjectWorkspaceDir({
+      companyId: input.companyId,
+      projectId: input.projectId,
+      repoName: deriveRepoNameFromRepoUrl(input.repoUrl),
     });
-    return { cwd, warning: null };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
-  }
+    await fs.mkdir(path.dirname(cwd), { recursive: true });
+    const stats = await fs.stat(cwd).catch(() => null);
+
+    if (!input.repoUrl) {
+      if (!stats) {
+        await fs.mkdir(cwd, { recursive: true });
+      }
+      return { cwd, warning: null };
+    }
+
+    const gitDirExists = await fs
+      .stat(path.resolve(cwd, ".git"))
+      .then((entry) => entry.isDirectory())
+      .catch(() => false);
+    if (gitDirExists) {
+      return { cwd, warning: null };
+    }
+
+    if (stats) {
+      const entries = await fs.readdir(cwd).catch(() => []);
+      if (entries.length > 0) {
+        return {
+          cwd,
+          warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
+        };
+      }
+      await fs.rm(cwd, { recursive: true, force: true });
+    }
+
+    try {
+      await execFile("git", ["clone", input.repoUrl, cwd], {
+        env: sanitizeRuntimeServiceBaseEnv(process.env),
+        timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+      });
+      return { cwd, warning: null };
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
+    }
+  });
 }
 
 type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
@@ -11460,9 +11466,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueContext.id), isNull(issues.responsibleUserId)));
       issueContext = { ...issueContext, responsibleUserId };
     }
+    const agentMaxConcurrentRuns = parseHeartbeatPolicy(agent).maxConcurrentRuns;
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
       parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
       isolatedWorkspacesEnabled,
+      agentMaxConcurrentRuns,
     );
     const trustPreset = resolveCoreTrustPreset({
       companyId: agent.companyId,
@@ -11503,6 +11511,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       projectPolicy: projectExecutionWorkspacePolicy,
       issueSettings: issueExecutionWorkspaceSettings,
       legacyUseProjectWorkspace: issueAssigneeOverrides?.useProjectWorkspace ?? null,
+      maxConcurrentRuns: agentMaxConcurrentRuns,
+      isolatedWorkspacesEnabled,
     });
     const requestedExecutionWorkspaceMode =
       trustPreset.kind === "low_trust_review" && resolvedExecutionWorkspaceMode === "shared_workspace"
@@ -12095,6 +12105,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             resolvedInstanceSettings.experimental.enableWorkspaceBranchReconcileForward,
           enableWorkspaceDirtyQuarantineRepair:
             resolvedInstanceSettings.experimental.enableWorkspaceDirtyQuarantineRepair,
+          run: { id: run.id },
           recorder: workspaceOperationRecorder,
         }),
       });
@@ -12138,9 +12149,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               projectId: resolvedProjectId,
               projectWorkspaceId: resolvedProjectWorkspaceId,
               sourceIssueId: issueRef?.id ?? null,
+              // Reflect what was actually realized, not merely requested — an
+              // isolated_workspace request degrades to a shared checkout when
+              // realizeExecutionWorkspace couldn't honor git_worktree (e.g. the
+              // workspace isn't backed by a git repo at all) (SSO-13621).
               mode:
                 requestedExecutionWorkspaceMode === "isolated_workspace"
-                  ? "isolated_workspace"
+                  ? (executionWorkspace.strategy === "git_worktree" ? "isolated_workspace" : "shared_workspace")
                   : requestedExecutionWorkspaceMode === "operator_branch"
                     ? "operator_branch"
                     : requestedExecutionWorkspaceMode === "agent_default"

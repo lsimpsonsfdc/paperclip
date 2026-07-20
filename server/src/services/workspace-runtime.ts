@@ -67,6 +67,10 @@ export interface ExecutionWorkspaceAgentRef {
   companyId: string;
 }
 
+export interface ExecutionWorkspaceRunRef {
+  id: string;
+}
+
 export interface RealizedExecutionWorkspace extends ExecutionWorkspaceInput {
   strategy: "project_primary" | "git_worktree";
   cwd: string;
@@ -393,6 +397,7 @@ function sanitizeSlugPart(value: string | null | undefined, fallback: string): s
 function renderWorkspaceTemplate(template: string, input: {
   issue: ExecutionWorkspaceIssueRef | null;
   agent: ExecutionWorkspaceAgentRef;
+  run: ExecutionWorkspaceRunRef | null;
   projectId: string | null;
   repoRef: string | null;
 }) {
@@ -407,6 +412,9 @@ function renderWorkspaceTemplate(template: string, input: {
     agent: {
       id: input.agent.id ?? "",
       name: input.agent.name,
+    },
+    run: {
+      id: input.run?.id ?? "",
     },
     project: {
       id: input.projectId ?? "",
@@ -2647,6 +2655,7 @@ export async function realizeExecutionWorkspace(input: {
   heartbeatRunId?: string | null;
   enableWorkspaceBranchReconcileForward?: boolean;
   enableWorkspaceDirtyQuarantineRepair?: boolean;
+  run?: ExecutionWorkspaceRunRef | null;
   recorder?: WorkspaceOperationRecorder | null;
 }): Promise<RealizedExecutionWorkspace> {
   const rawStrategy = parseObject(input.config.workspaceStrategy);
@@ -2664,11 +2673,33 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
+  // A workspace that isn't backed by a git checkout at all (e.g. a plain
+  // scratch directory with no repoUrl) can't be worktree-isolated — there's
+  // no repo to branch off, and running git against it would just throw.
+  // Degrade to project_primary instead of failing the run (SSO-13621).
+  if (!(await isGitCheckout(input.base.baseCwd))) {
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: input.base.baseCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        `Workspace at "${input.base.baseCwd}" is not a git checkout; skipping git_worktree strategy and using it as-is.`,
+      ],
+      created: false,
+    };
+  }
+
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
-  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
+  // Key the default branch/path by run, not just issue+slug — two concurrent
+  // runs on the same issue (re-checkout, retry, etc.) would otherwise compute
+  // the same worktree path and collide (SSO-13618/SSO-13621).
+  const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}-{{run.id}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
     issue: input.issue,
     agent: input.agent,
+    run: input.run ?? null,
     projectId: input.base.projectId,
     repoRef: input.base.repoRef,
   });

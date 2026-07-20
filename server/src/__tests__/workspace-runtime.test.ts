@@ -670,6 +670,92 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
+  it("keys the default branch/worktree template by run id so concurrent runs on the same issue don't collide (SSO-13621)", async () => {
+    const repoRoot = await createTempRepo();
+    const baseInput = {
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary" as const,
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          // No branchTemplate override — exercises the default template.
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-900",
+        title: "Concurrent Runs Same Issue",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    };
+
+    const [runA, runB] = await Promise.all([
+      realizeExecutionWorkspace({ ...baseInput, run: { id: "run-aaaa" } }),
+      realizeExecutionWorkspace({ ...baseInput, run: { id: "run-bbbb" } }),
+    ]);
+
+    expect(runA.strategy).toBe("git_worktree");
+    expect(runB.strategy).toBe("git_worktree");
+    expect(runA.created).toBe(true);
+    expect(runB.created).toBe(true);
+    expect(runA.branchName).toContain("run-aaaa");
+    expect(runB.branchName).toContain("run-bbbb");
+    expect(runA.branchName).not.toBe(runB.branchName);
+    expect(runA.cwd).not.toBe(runB.cwd);
+    await expect(fs.stat(path.join(runA.cwd, ".git"))).resolves.toBeTruthy();
+    await expect(fs.stat(path.join(runB.cwd, ".git"))).resolves.toBeTruthy();
+  });
+
+  it("degrades to project_primary instead of throwing when git_worktree is requested for a non-git-backed workspace (SSO-13621)", async () => {
+    const plainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-non-git-"));
+
+    const workspace = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: plainDir,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-901",
+        title: "Non Git Backed Workspace",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+      run: { id: "run-cccc" },
+    });
+
+    expect(workspace.strategy).toBe("project_primary");
+    expect(workspace.created).toBe(false);
+    expect(workspace.cwd).toBe(plainDir);
+    expect(workspace.branchName).toBeNull();
+    expect(workspace.worktreePath).toBeNull();
+    expect(workspace.warnings).toEqual([
+      expect.stringContaining("is not a git checkout"),
+    ]);
+  });
+
   it("bases a fresh worktree on origin/master even when local master has unpushed commits", async () => {
     const { repoRoot } = await createClonedRepoWithRemote();
     const originHead = await readGit(repoRoot, ["rev-parse", "origin/master"]);

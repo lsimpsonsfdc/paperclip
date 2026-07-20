@@ -150,8 +150,27 @@ export function parseProjectExecutionWorkspacePolicy(raw: unknown): ProjectExecu
 export function gateProjectExecutionWorkspacePolicy(
   projectPolicy: ProjectExecutionWorkspacePolicy | null,
   isolatedWorkspacesEnabled: boolean,
+  maxConcurrentRuns = 1,
 ): ProjectExecutionWorkspacePolicy | null {
   if (!isolatedWorkspacesEnabled) return null;
+  if (maxConcurrentRuns > 1) {
+    const resolvedDefaultMode = projectPolicy?.enabled ? projectPolicy.defaultMode : undefined;
+    const resolvesToSharedWorkspace = !resolvedDefaultMode || resolvedDefaultMode === "shared_workspace";
+    if (resolvesToSharedWorkspace) {
+      // shared_workspace/project_primary is unsafe once more than one run can
+      // execute concurrently against the same checkout — force isolation
+      // instead of silently handing out a shared working tree (SSO-13618).
+      return {
+        ...(projectPolicy ?? { enabled: true }),
+        enabled: true,
+        defaultMode: "isolated_workspace",
+        workspaceStrategy:
+          projectPolicy?.workspaceStrategy?.type === "git_worktree"
+            ? projectPolicy.workspaceStrategy
+            : { type: "git_worktree" },
+      };
+    }
+  }
   return projectPolicy;
 }
 
@@ -264,21 +283,39 @@ export function resolveExecutionWorkspaceMode(input: {
   projectPolicy: ProjectExecutionWorkspacePolicy | null;
   issueSettings: IssueExecutionWorkspaceSettings | null;
   legacyUseProjectWorkspace: boolean | null;
+  maxConcurrentRuns?: number;
+  isolatedWorkspacesEnabled?: boolean;
 }): ParsedExecutionWorkspaceMode {
-  const issueMode = input.issueSettings?.mode;
-  if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
-    return issueMode;
-  }
-  if (input.projectPolicy?.enabled) {
-    if (input.projectPolicy.defaultMode === "isolated_workspace") return "isolated_workspace";
-    if (input.projectPolicy.defaultMode === "operator_branch") return "operator_branch";
-    if (input.projectPolicy.defaultMode === "adapter_default") return "agent_default";
+  const resolved = ((): ParsedExecutionWorkspaceMode => {
+    const issueMode = input.issueSettings?.mode;
+    if (issueMode && issueMode !== "inherit" && issueMode !== "reuse_existing") {
+      return issueMode;
+    }
+    if (input.projectPolicy?.enabled) {
+      if (input.projectPolicy.defaultMode === "isolated_workspace") return "isolated_workspace";
+      if (input.projectPolicy.defaultMode === "operator_branch") return "operator_branch";
+      if (input.projectPolicy.defaultMode === "adapter_default") return "agent_default";
+      return "shared_workspace";
+    }
+    if (input.legacyUseProjectWorkspace === false) {
+      return "agent_default";
+    }
     return "shared_workspace";
+  })();
+
+  // Defense-in-depth: even if an issue-level override explicitly requests
+  // shared_workspace, never hand out a shared checkout when more than one
+  // run can execute concurrently for this agent (SSO-13618). Gated on the
+  // instance-level isolated-workspaces flag, same as gateProjectExecutionWorkspacePolicy
+  // — this is not the switch that decides whether isolation is available at all.
+  if (
+    resolved === "shared_workspace" &&
+    (input.isolatedWorkspacesEnabled ?? true) &&
+    (input.maxConcurrentRuns ?? 1) > 1
+  ) {
+    return "isolated_workspace";
   }
-  if (input.legacyUseProjectWorkspace === false) {
-    return "agent_default";
-  }
-  return "shared_workspace";
+  return resolved;
 }
 
 export function buildExecutionWorkspaceAdapterConfig(input: {

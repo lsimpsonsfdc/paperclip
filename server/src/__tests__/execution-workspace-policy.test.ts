@@ -356,4 +356,187 @@ describe("execution workspace policy helpers", () => {
       ),
     ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
   });
+
+  it("forces isolated git_worktree when maxConcurrentRuns>1 would otherwise resolve to a shared workspace (SSO-13621)", () => {
+    // No project policy configured at all — the silent shared_workspace default.
+    expect(gateProjectExecutionWorkspacePolicy(null, true, 2)).toEqual({
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree" },
+    });
+
+    // Policy explicitly enabled but left at (or defaulted to) shared_workspace.
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "shared_workspace" },
+        true,
+        2,
+      ),
+    ).toEqual({
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree" },
+    });
+
+    // Policy enabled with no defaultMode set at all.
+    expect(
+      gateProjectExecutionWorkspacePolicy({ enabled: true }, true, 2),
+    ).toEqual({
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree" },
+    });
+
+    // Already-configured git_worktree strategy is preserved, not clobbered.
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        {
+          enabled: true,
+          defaultMode: "shared_workspace",
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/develop" },
+        },
+        true,
+        2,
+      ),
+    ).toEqual({
+      enabled: true,
+      defaultMode: "isolated_workspace",
+      workspaceStrategy: { type: "git_worktree", baseRef: "origin/develop" },
+    });
+  });
+
+  it("does not force isolation when maxConcurrentRuns<=1 or the feature flag is off", () => {
+    expect(
+      gateProjectExecutionWorkspacePolicy(null, true, 1),
+    ).toBeNull();
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "shared_workspace" },
+        true,
+        1,
+      ),
+    ).toEqual({ enabled: true, defaultMode: "shared_workspace" });
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "shared_workspace" },
+        false,
+        2,
+      ),
+    ).toBeNull();
+  });
+
+  it("does not force isolation for already-isolated/operator_branch/adapter_default modes", () => {
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "isolated_workspace" },
+        true,
+        4,
+      ),
+    ).toEqual({ enabled: true, defaultMode: "isolated_workspace" });
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "operator_branch" },
+        true,
+        4,
+      ),
+    ).toEqual({ enabled: true, defaultMode: "operator_branch" });
+    expect(
+      gateProjectExecutionWorkspacePolicy(
+        { enabled: true, defaultMode: "adapter_default" },
+        true,
+        4,
+      ),
+    ).toEqual({ enabled: true, defaultMode: "adapter_default" });
+  });
+
+  it("resolveExecutionWorkspaceMode forces isolated_workspace when resolution would be shared and runs can execute concurrently", () => {
+    // Project-policy-driven shared default, forced.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 2,
+      }),
+    ).toBe("isolated_workspace");
+
+    // Explicit issue-level override to shared_workspace is still overridden —
+    // a shared checkout is never safe once concurrency is possible.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 3,
+      }),
+    ).toBe("isolated_workspace");
+
+    // maxConcurrentRuns<=1 (or omitted) preserves prior behavior exactly.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+      }),
+    ).toBe("shared_workspace");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 1,
+      }),
+    ).toBe("shared_workspace");
+
+    // Non-shared resolutions (operator_branch, agent_default) are untouched.
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "operator_branch" },
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+      }),
+    ).toBe("operator_branch");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: false,
+        maxConcurrentRuns: 5,
+      }),
+    ).toBe("agent_default");
+  });
+
+  it("does not force isolation via resolveExecutionWorkspaceMode when the isolated-workspaces instance flag is off", () => {
+    // The instance-level flag is the master switch for the whole isolated-workspaces
+    // subsystem — the concurrency guard must not bypass it (SSO-13621 CI fix).
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+        isolatedWorkspacesEnabled: false,
+      }),
+    ).toBe("shared_workspace");
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: { enabled: true, defaultMode: "isolated_workspace" },
+        issueSettings: { mode: "shared_workspace" },
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+        isolatedWorkspacesEnabled: false,
+      }),
+    ).toBe("shared_workspace");
+
+    // Omitting the flag preserves the existing forcing behavior (defaults to enabled).
+    expect(
+      resolveExecutionWorkspaceMode({
+        projectPolicy: null,
+        issueSettings: null,
+        legacyUseProjectWorkspace: null,
+        maxConcurrentRuns: 5,
+      }),
+    ).toBe("isolated_workspace");
+  });
 });
