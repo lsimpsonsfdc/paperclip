@@ -131,6 +131,7 @@ vi.mock("../services/index.js", () => ({
   }),
   accessService: () => mockAccessService,
   agentService: () => mockAgentService,
+  approvalService: () => ({ getById: vi.fn(async () => null) }),
   companySkillService: () => ({
     completeTestRunForIssue: vi.fn(async () => null),
   }),
@@ -161,6 +162,14 @@ vi.mock("../services/index.js", () => ({
   issueTreeControlService: () => mockIssueTreeControlService,
   logActivity: mockLogActivity,
   projectService: () => ({}),
+  reviewerDispositionService: () => ({
+    checkBlockingDispositionForDoneTransition: vi.fn(async () => ({ blocked: false })),
+    getLatestForIssue: vi.fn(async () => null),
+    recordDisposition: vi.fn(async () => ({ disposition: "advisory", row: {} })),
+    setPhaseBBlockingEnabled: vi.fn(async () => ({})),
+    resolvePhaseBBlockingEnabled: vi.fn(async () => false),
+    hasActiveOverrideApproval: vi.fn(async () => false),
+  }),
   routineService: () => mockRoutineService,
   workProductService: () => ({}),
 }));

@@ -1184,6 +1184,15 @@ export const submitReviewerDispositionSchema = z.object({
 
 export type SubmitReviewerDisposition = z.infer<typeof submitReviewerDispositionSchema>;
 
+// SSO-13507: request body for the reviewer-disposition kill switch — flips
+// phase_b_blocking_enabled for an agent identity within a company.
+export const setReviewerDispositionRoleSettingSchema = z.object({
+  agentNameKey: z.string().min(1),
+  phaseBBlockingEnabled: z.boolean(),
+});
+
+export type SetReviewerDispositionRoleSetting = z.infer<typeof setReviewerDispositionRoleSettingSchema>;
+
 export const createIssueAttachmentMetadataSchema = z.object({
   issueCommentId: z.string().uuid().optional().nullable(),
 });

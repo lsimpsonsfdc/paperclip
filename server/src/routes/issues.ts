@@ -47,6 +47,7 @@ import {
   upsertIssueWatchdogSchema,
   linkIssueApprovalSchema,
   submitReviewerDispositionSchema,
+  setReviewerDispositionRoleSettingSchema,
   issueDocumentKeySchema,
   ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
@@ -96,6 +97,7 @@ import * as serviceIndex from "../services/index.js";
 import {
   accessService,
   agentService,
+  approvalService,
   companySkillService,
   companyService,
   companySearchService,
@@ -2579,6 +2581,7 @@ export function issueRoutes(
   const projectsSvc = projectService(db);
   const goalsSvc = goalService(db);
   const issueApprovalsSvc = issueApprovalService(db);
+  const approvalsSvc = approvalService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const reviewerDispositionSvc = reviewerDispositionService(db);
   const executionWorkspacesSvc = executionWorkspaceServiceDirect(db);
@@ -3281,6 +3284,32 @@ export function issueRoutes(
     }
     if (actorAgent.role === "ceo" || Boolean(actorAgent.permissions?.canCreateAgents)) return true;
     res.status(403).json({ error: "Missing permission to link approvals" });
+    return false;
+  }
+
+  /**
+   * SSO-13507: gate for the Reviewer block_done kill switch
+   * (POST /companies/:companyId/reviewer-disposition-settings). Per
+   * runbooks/override-deterministic-block.md, this is board-only or the
+   * company's CEO agent identity — the same incident-response authority the
+   * runbook already documents, now actually reachable over the API.
+   */
+  async function assertCanManagePhaseBBlockingKillSwitch(req: Request, res: Response, companyId: string) {
+    assertCompanyAccess(req, companyId);
+    if (req.actor.type === "board") return true;
+    if (!req.actor.agentId) {
+      res.status(403).json({ error: "Agent authentication required" });
+      return false;
+    }
+    const actorAgent = await agentsSvc.getById(req.actor.agentId);
+    if (!actorAgent || actorAgent.companyId !== companyId) {
+      res.status(403).json({ error: "Forbidden" });
+      return false;
+    }
+    if (actorAgent.role === "ceo") return true;
+    res.status(403).json({
+      error: "Only board users or the company's CEO agent can toggle the reviewer disposition kill switch",
+    });
     return false;
   }
 
@@ -4203,6 +4232,12 @@ export function issueRoutes(
    * `block_done` Reviewer disposition (a `[deterministic] blocking` FAIL) and that
    * disposition's role is currently phase_b_blocking_enabled for this company.
    *
+   * SSO-13507: the actual block_done/override/kill-switch resolution now lives in
+   * checkBlockingDispositionForDoneTransition (server/src/services/reviewer-dispositions.ts)
+   * so it's a single choke point shared with issueService.update() — every write path
+   * that can set status to "done" is covered by construction, not just this route.
+   * This function only formats the route's 403 response for the documented call site.
+   *
    * Fail-mode: on a disposition-lookup error, this throws (fail-closed) rather than
    * silently allowing the transition. Blast radius is narrow — only issues that
    * already have a `block_done` row for a flagged-on role are affected by a lookup
@@ -4216,22 +4251,10 @@ export function issueRoutes(
     res: Response,
     issue: { id: string; companyId: string },
   ) {
-    const disposition = await reviewerDispositionSvc.getLatestForIssue(issue.id);
-    if (!disposition || disposition.disposition !== "block_done") return true;
+    const check = await reviewerDispositionSvc.checkBlockingDispositionForDoneTransition(issue);
+    if (!check.blocked) return true;
 
-    // Live re-check (not the value captured at write time) so a CEO-callable
-    // kill-switch flip immediately unblocks issues without needing a per-issue
-    // override approval.
-    const stillEnabled = await reviewerDispositionSvc.resolvePhaseBBlockingEnabled(
-      issue.companyId,
-      disposition.agentNameKey,
-    );
-    if (!stillEnabled) return true;
-
-    if (await reviewerDispositionSvc.hasActiveOverrideApproval(issue.id, disposition.updatedAt)) {
-      return true;
-    }
-
+    const disposition = check.disposition;
     res.status(403).json({
       error: "Blocked by a Reviewer deterministic-blocking disposition",
       failingCheckId: disposition.failingCheckIds,
@@ -6972,6 +6995,23 @@ export function issueRoutes(
     if (!(await assertApprovalMutationAllowedByRunContext(req, res, issue))) return;
     if (!(await assertCanManageIssueApprovalLinks(req, res, issue.companyId))) return;
 
+    const approvalToLink = await approvalsSvc.getById(req.body.approvalId);
+    if (!approvalToLink) {
+      res.status(404).json({ error: "Approval not found" });
+      return;
+    }
+    // SSO-13507: linking an *already-approved* override_deterministic_block approval
+    // (granted for a different issue) onto this issue would satisfy the Reviewer
+    // block_done guard without a fresh board decision for this specific block — a
+    // confused-deputy bypass. Creating this approval type is already board-only
+    // (POST /companies/:companyId/approvals); require the same for linking it.
+    if (approvalToLink.type === "override_deterministic_block" && req.actor.type !== "board") {
+      res.status(403).json({
+        error: "Only board users can link override_deterministic_block approvals to an issue",
+      });
+      return;
+    }
+
     const actor = getActorInfo(req);
     await issueApprovalsSvc.link(id, req.body.approvalId, {
       agentId: actor.agentId,
@@ -7089,6 +7129,46 @@ export function issueRoutes(
       });
 
       res.status(201).json(row);
+    },
+  );
+
+  // SSO-13507: makes the "CEO-callable kill-switch" described in
+  // runbooks/override-deterministic-block.md actually reachable over the API — flips
+  // phase_b_blocking_enabled for an agent identity within a company. The PATCH
+  // /issues/:id guard re-checks this flag live, so flipping it off immediately
+  // unblocks every issue for that agent identity/company without per-issue overrides.
+  router.post(
+    "/companies/:companyId/reviewer-disposition-settings",
+    validate(setReviewerDispositionRoleSettingSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      if (!(await assertCanManagePhaseBBlockingKillSwitch(req, res, companyId))) return;
+
+      const actor = getActorInfo(req);
+      const row = await reviewerDispositionSvc.setPhaseBBlockingEnabled({
+        companyId,
+        agentNameKey: req.body.agentNameKey,
+        phaseBBlockingEnabled: req.body.phaseBBlockingEnabled,
+        updatedByUserId: actor.actorType === "user" ? actor.actorId : null,
+      });
+
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "reviewer_disposition_role_setting.updated",
+        entityType: "reviewer_disposition_role_setting",
+        entityId: row.id,
+        details: {
+          agentNameKey: req.body.agentNameKey,
+          phaseBBlockingEnabled: req.body.phaseBBlockingEnabled,
+        },
+      });
+
+      res.status(200).json(row);
     },
   );
 

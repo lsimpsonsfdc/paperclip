@@ -1,4 +1,5 @@
-import { pgTable, uuid, text, timestamp, jsonb, uniqueIndex, index } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { pgTable, uuid, text, timestamp, jsonb, uniqueIndex, index, check } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { issues } from "./issues.js";
 
@@ -29,5 +30,9 @@ export const reviewerDispositions = pgTable(
   (table) => ({
     issueUq: uniqueIndex("reviewer_dispositions_issue_uq").on(table.issueId),
     companyIdx: index("reviewer_dispositions_company_idx").on(table.companyId),
+    dispositionCheck: check(
+      "reviewer_dispositions_disposition_check",
+      sql`${table.disposition} in ('block_done', 'advisory')`,
+    ),
   }),
 );

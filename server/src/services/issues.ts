@@ -62,9 +62,10 @@ import {
   isUuidLike,
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
+import { checkBlockingDispositionForDoneTransition } from "./reviewer-dispositions.js";
 import {
   defaultIssueExecutionWorkspaceSettingsForProject,
   gateProjectExecutionWorkspacePolicy,
@@ -6257,6 +6258,28 @@ export function issueService(db: Db) {
 
       if (issueData.status) {
         assertTransition(existing.status, issueData.status);
+      }
+
+      // SSO-13507: choke-point enforcement of the Reviewer block_done guard. This
+      // covers every write path that can set status to "done" (PATCH /issues/:id,
+      // the comment auto-approval branch, the recovery watchdog fold, etc.) by
+      // construction, instead of relying on each call site remembering to check.
+      if (issueData.status === "done" && existing.status !== "done") {
+        const dispositionCheck = await checkBlockingDispositionForDoneTransition(dbOrTx, {
+          id: existing.id,
+          companyId: existing.companyId,
+        });
+        if (dispositionCheck.blocked) {
+          const disposition = dispositionCheck.disposition;
+          throw forbidden("Blocked by a Reviewer deterministic-blocking disposition", {
+            issueId: existing.id,
+            disposition: disposition.disposition,
+            agentNameKey: disposition.agentNameKey,
+            checkKind: disposition.checkKind,
+            failingCheckIds: disposition.failingCheckIds,
+            bypass: "Request an override_deterministic_block approval linked to this issue (board-only).",
+          });
+        }
       }
 
       const patch: Partial<typeof issues.$inferInsert> = {

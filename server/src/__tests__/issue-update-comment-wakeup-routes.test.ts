@@ -73,6 +73,15 @@ vi.mock("../services/index.js", () => ({
     listCompanyIds: vi.fn(async () => ["company-1"]),
   }),
   issueApprovalService: () => ({}),
+  approvalService: () => ({ getById: vi.fn(async () => null) }),
+  reviewerDispositionService: () => ({
+    checkBlockingDispositionForDoneTransition: vi.fn(async () => ({ blocked: false })),
+    getLatestForIssue: vi.fn(async () => null),
+    recordDisposition: vi.fn(async () => ({ disposition: "advisory", row: {} })),
+    setPhaseBBlockingEnabled: vi.fn(async () => ({})),
+    resolvePhaseBBlockingEnabled: vi.fn(async () => false),
+    hasActiveOverrideApproval: vi.fn(async () => false),
+  }),
   issueReferenceService: () => ({
     deleteDocumentSource: async () => undefined,
     diffIssueReferenceSummary: () => ({
@@ -145,6 +154,15 @@ function registerModuleMocks() {
       listCompanyIds: vi.fn(async () => ["company-1"]),
     }),
     issueApprovalService: () => ({}),
+    approvalService: () => ({ getById: vi.fn(async () => null) }),
+    reviewerDispositionService: () => ({
+      checkBlockingDispositionForDoneTransition: vi.fn(async () => ({ blocked: false })),
+      getLatestForIssue: vi.fn(async () => null),
+      recordDisposition: vi.fn(async () => ({ disposition: "advisory", row: {} })),
+      setPhaseBBlockingEnabled: vi.fn(async () => ({})),
+      resolvePhaseBBlockingEnabled: vi.fn(async () => false),
+      hasActiveOverrideApproval: vi.fn(async () => false),
+    }),
     issueReferenceService: () => ({
       deleteDocumentSource: async () => undefined,
       diffIssueReferenceSummary: () => ({

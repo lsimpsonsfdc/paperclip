@@ -27,7 +27,7 @@ import {
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
-import { forbidden, notFound } from "../../errors.js";
+import { forbidden, HttpError, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
@@ -1474,7 +1474,26 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     if (!finalizedRun) return { kind: "skipped" as const };
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
-      await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
+      try {
+        await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
+      } catch (err) {
+        // SSO-13507: issueService.update() fail-closes a "done" transition when the
+        // evaluation issue carries an active Reviewer block_done disposition. Don't let
+        // this background fold silently defeat that guard — leave the issue open and
+        // require the normal bypass (override approval or kill switch) instead of
+        // treating the lookup failure/block as fatal to the whole watchdog scan.
+        if (err instanceof HttpError && err.status === 403) {
+          await issuesSvc.addComment(input.existingEvaluation.id, [
+            "Source-resolved watchdog fold skipped.",
+            "",
+            "This evaluation issue is blocked by an active Reviewer deterministic-blocking",
+            "disposition, so it was not auto-closed. Resolve the disposition (override",
+            "approval or kill switch) or close it manually.",
+          ].join("\n"), { runId: input.run.id });
+          return { kind: "skipped" as const };
+        }
+        throw err;
+      }
       await issuesSvc.addComment(input.existingEvaluation.id, [
         "Source-resolved watchdog fold.",
         "",
