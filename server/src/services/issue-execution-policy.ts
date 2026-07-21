@@ -61,6 +61,9 @@ type TransitionResult = {
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
+// The only issue status a current stage participant may submit to request changes.
+// Any other non-"done"/non-"in_review" status is a stray value, not a formal decision.
+const CHANGES_REQUESTED_TRIGGER_STATUS = "in_progress";
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
@@ -744,6 +747,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       }
 
       if (requestedStatus && requestedStatus !== "in_review") {
+        if (requestedStatus !== CHANGES_REQUESTED_TRIGGER_STATUS) {
+          throw unprocessable(
+            `"${requestedStatus}" is not a valid decision for the active ${activeStage.type} stage. ` +
+              `Use status: "done" with a comment to approve, or status: "${CHANGES_REQUESTED_TRIGGER_STATUS}" with a comment to request changes.`,
+            { validActions: ["done", CHANGES_REQUESTED_TRIGGER_STATUS] },
+          );
+        }
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }

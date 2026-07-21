@@ -464,6 +464,68 @@ describe("issue execution policy transitions", () => {
         currentParticipant: { type: "agent", agentId: qaAgentId },
       });
     });
+
+    it("stray non-done/non-in_progress status from the active reviewer is rejected, not recorded as a decision", () => {
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "blocked",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "Just leaving a status note",
+        }),
+      ).toThrow(/not a valid decision.*"done".*"in_progress"/s);
+    });
+
+    it("stray status error includes machine-readable valid actions for harness retry", () => {
+      try {
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: qaAgentId,
+            assigneeUserId: null,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: reviewStageId,
+              currentStageIndex: 0,
+              currentStageType: "review",
+              currentParticipant: { type: "agent", agentId: qaAgentId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "cancelled",
+          requestedAssigneePatch: {},
+          actor: { agentId: qaAgentId },
+          commentBody: "Trying to cancel mid-review",
+        });
+        expect.unreachable("expected applyIssueExecutionPolicyTransition to throw");
+      } catch (error: any) {
+        expect(error.status).toBe(422);
+        expect(error.details).toEqual({ validActions: ["done", "in_progress"] });
+      }
+    });
   });
 
   describe("review-only policy (no approval stage)", () => {
@@ -1156,6 +1218,39 @@ describe("issue execution policy transitions", () => {
         stageType: "approval",
         outcome: "changes_requested",
       });
+    });
+
+    it("blocks the SSO-13728 incident shape: an approval-stage participant's stray 'blocked' PATCH is never recorded as changes_requested", () => {
+      const policy = twoStagePolicy();
+      const reviewStageId = policy.stages[0].id;
+      const approvalStageId = policy.stages[1].id;
+
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: ctoUserId,
+            executionPolicy: policy,
+            executionState: {
+              status: "pending",
+              currentStageId: approvalStageId,
+              currentStageIndex: 1,
+              currentStageType: "approval",
+              currentParticipant: { type: "user", userId: ctoUserId },
+              returnAssignee: { type: "agent", agentId: coderAgentId },
+              completedStageIds: [reviewStageId],
+              lastDecisionId: null,
+              lastDecisionOutcome: null,
+            },
+          },
+          policy,
+          requestedStatus: "blocked",
+          requestedAssigneePatch: {},
+          actor: { userId: ctoUserId },
+          commentBody: "Waiting on infra before I can sign off",
+        }),
+      ).toThrow(/not a valid decision/);
     });
   });
 
