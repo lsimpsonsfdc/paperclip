@@ -662,6 +662,146 @@ describe("issue execution policy transitions", () => {
     });
   });
 
+  describe("stage participant delegation (SSO-15683)", () => {
+    function approvalIssue(policy: IssueExecutionPolicy) {
+      const approvalStageId = policy.stages[0].id;
+      return {
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: ctoUserId,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentStageIndex: 0,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: ctoUserId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        } satisfies IssueExecutionState,
+      };
+    }
+
+    it("active approver can delegate the stage with a comment + assignee patch and no status", () => {
+      const policy = approvalOnlyPolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: approvalIssue(policy),
+        policy,
+        requestedStatus: undefined,
+        requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+        actor: { userId: ctoUserId },
+        commentBody: "Handing this approval to QA",
+      });
+
+      expect(result.patch.status).toBe("in_review");
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentStageType: "approval",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+      });
+      expect(result.workflowControlledAssignment).toBe(true);
+      const delegatedPolicy = result.patch.executionPolicy as IssueExecutionPolicy;
+      expect(delegatedPolicy.stages[0].participants).toEqual(
+        expect.arrayContaining([expect.objectContaining({ type: "agent", agentId: qaAgentId })]),
+      );
+    });
+
+    it("delegation also applies when the patch pins status in_review", () => {
+      const policy = approvalOnlyPolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: approvalIssue(policy),
+        policy,
+        requestedStatus: "in_review",
+        requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+        actor: { userId: ctoUserId },
+        commentBody: "Handing this approval to QA",
+      });
+
+      expect(result.patch.assigneeAgentId).toBe(qaAgentId);
+      expect(result.patch.executionState).toMatchObject({
+        status: "pending",
+        currentParticipant: { type: "agent", agentId: qaAgentId },
+      });
+    });
+
+    it("the delegate becomes a durable stage participant and can approve", () => {
+      const policy = approvalOnlyPolicy();
+      const first = applyIssueExecutionPolicyTransition({
+        issue: approvalIssue(policy),
+        policy,
+        requestedStatus: undefined,
+        requestedAssigneePatch: { assigneeAgentId: qaAgentId },
+        actor: { userId: ctoUserId },
+        commentBody: "Handing this approval to QA",
+      });
+
+      const delegatedPolicy = first.patch.executionPolicy as IssueExecutionPolicy;
+      const second = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: delegatedPolicy,
+          executionState: first.patch.executionState as IssueExecutionState,
+        },
+        policy: delegatedPolicy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+        commentBody: "Approved as delegate",
+      });
+
+      expect(second.decision).toMatchObject({ stageType: "approval", outcome: "approved" });
+      expect(second.patch.executionState).toMatchObject({ status: "completed" });
+    });
+
+    it("delegating to the return assignee is rejected with actionable guidance", () => {
+      const policy = approvalOnlyPolicy();
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: approvalIssue(policy),
+          policy,
+          requestedStatus: undefined,
+          requestedAssigneePatch: { assigneeAgentId: coderAgentId },
+          actor: { userId: ctoUserId },
+          commentBody: "Sending back to the author",
+        }),
+      ).toThrow(/cannot be delegated to the return assignee.*"done" with a comment/s);
+    });
+
+    it("clearing the assignee mid-stage is rejected with actionable guidance", () => {
+      const policy = approvalOnlyPolicy();
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: approvalIssue(policy),
+          policy,
+          requestedStatus: undefined,
+          requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: null },
+          actor: { userId: ctoUserId },
+          commentBody: "Unassigning",
+        }),
+      ).toThrow(/Clearing the assignee.*without a participant/s);
+    });
+
+    it("non-participants still cannot reassign the active stage", () => {
+      const policy = approvalOnlyPolicy();
+      expect(() =>
+        applyIssueExecutionPolicyTransition({
+          issue: approvalIssue(policy),
+          policy,
+          requestedStatus: undefined,
+          requestedAssigneePatch: { assigneeAgentId: ctoAgentId },
+          actor: { agentId: coderAgentId },
+          commentBody: "Trying to grab the approval",
+        }),
+      ).toThrow("Only the active reviewer or approver can advance");
+    });
+  });
+
   describe("comment requirements", () => {
     const policy = twoStagePolicy();
     const reviewStageId = policy.stages[0].id;

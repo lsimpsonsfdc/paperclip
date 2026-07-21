@@ -461,6 +461,35 @@ function stageHasParticipant(stage: IssueExecutionStage, participant: IssueExecu
   return stage.participants.some((candidate) => principalsEqual(candidate, participant));
 }
 
+// Delegation must also add the delegate to the stage's participant list: the
+// "policy edits while a stage is active" branch reassigns any currentParticipant
+// that is missing from the stage, so a state-only delegation would silently
+// revert on the next patch.
+function policyWithStageParticipant(
+  policy: IssueExecutionPolicy,
+  stageId: string,
+  principal: IssueExecutionStagePrincipal,
+): IssueExecutionPolicy {
+  return {
+    ...policy,
+    stages: policy.stages.map((stage) => {
+      if (stage.id !== stageId || stageHasParticipant(stage, principal)) return stage;
+      return {
+        ...stage,
+        participants: [
+          ...stage.participants,
+          {
+            id: randomUUID(),
+            type: principal.type,
+            agentId: principal.type === "agent" ? principal.agentId ?? null : null,
+            userId: principal.type === "user" ? principal.userId ?? null : null,
+          },
+        ],
+      };
+    }),
+  };
+}
+
 function patchForPrincipal(principal: IssueExecutionStagePrincipal | null) {
   if (!principal) {
     return { assigneeAgentId: null, assigneeUserId: null };
@@ -774,6 +803,45 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
           workflowControlledAssignment: true,
         };
       }
+
+      // Assignee patch with no status decision: the active participant is
+      // delegating the stage to someone else, not advancing it. Without this
+      // branch the request falls through to the generic guard below, which
+      // rejects the very participant it is meant to authorize (SSO-15683).
+      if (requestedAssigneePatchProvided && !principalsEqual(explicitAssignee, currentParticipant)) {
+        if (!explicitAssignee) {
+          throw unprocessable(
+            `Clearing the assignee would leave the active ${activeStage.type} stage without a participant. ` +
+              `Assign a specific agent or user to delegate the stage, use status: "done" with a comment to approve, ` +
+              `or status: "${CHANGES_REQUESTED_TRIGGER_STATUS}" with a comment to request changes.`,
+            { validActions: ["delegate", "done", CHANGES_REQUESTED_TRIGGER_STATUS] },
+          );
+        }
+        if (principalsEqual(explicitAssignee, existingState?.returnAssignee ?? null)) {
+          throw unprocessable(
+            `The active ${activeStage.type} stage cannot be delegated to the return assignee whose work is being ${activeStage.type === "approval" ? "approved" : "reviewed"}. ` +
+              `Use status: "done" with a comment to approve, or status: "${CHANGES_REQUESTED_TRIGGER_STATUS}" with a comment to request changes.`,
+            { validActions: ["done", CHANGES_REQUESTED_TRIGGER_STATUS] },
+          );
+        }
+
+        const delegatedPolicy = policyWithStageParticipant(input.policy, activeStage.id, explicitAssignee);
+        const delegatedStage = findStageById(delegatedPolicy, activeStage.id) ?? activeStage;
+        patch.executionPolicy = delegatedPolicy;
+        buildPendingStagePatch({
+          patch,
+          previous: existingState,
+          policy: delegatedPolicy,
+          stage: delegatedStage,
+          participant: explicitAssignee,
+          returnAssignee: existingState?.returnAssignee ?? currentAssignee ?? actor,
+          reviewRequest: effectiveReviewRequest,
+        });
+        return {
+          patch,
+          workflowControlledAssignment: true,
+        };
+      }
     }
 
     const attemptedStageAdvance =
@@ -904,6 +972,12 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
     stagePatch.executionState !== undefined
       ? parseIssueExecutionState(stagePatch.executionState)
       : existingState;
+  // Stage transitions (e.g. participant delegation) may have already rewritten
+  // the policy; stripping the monitor from input.policy would discard that.
+  const effectivePolicy =
+    stagePatch.executionPolicy !== undefined
+      ? (stagePatch.executionPolicy as IssueExecutionPolicy | null)
+      : input.policy;
   const invalidReason = input.policy?.monitor
     ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
     : null;
@@ -915,7 +989,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
       if (input.monitorExplicitlyUpdated) {
         throw unprocessable(MONITOR_INVALID_MESSAGE);
       }
-      patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
+      patch.executionPolicy = stripMonitorFromExecutionPolicy(effectivePolicy);
       patch.monitorNextCheckAt = null;
       patch.monitorWakeRequestedAt = null;
       targetMonitorState = buildClearedMonitorState({
@@ -933,7 +1007,7 @@ function applyMonitorTransition(input: TransitionInput, stagePatch: Record<strin
         if (input.monitorExplicitlyUpdated) {
           throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
         }
-        patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
+        patch.executionPolicy = stripMonitorFromExecutionPolicy(effectivePolicy);
         patch.monitorNextCheckAt = null;
         patch.monitorWakeRequestedAt = null;
         targetMonitorState = buildClearedMonitorState({
