@@ -1212,6 +1212,8 @@ export function IssueDetail() {
   const [treeControlReason, setTreeControlReason] = useState("");
   const [treeControlWakeAgentsOnResume, setTreeControlWakeAgentsOnResume] = useState(false);
   const [treeControlCancelConfirmed, setTreeControlCancelConfirmed] = useState(false);
+  const [stageDecisionStatus, setStageDecisionStatus] = useState<"done" | "in_progress" | null>(null);
+  const [stageDecisionComment, setStageDecisionComment] = useState("");
   const [optimisticComments, setOptimisticComments] = useState<OptimisticIssueComment[]>([]);
   const [locallyQueuedCommentRunIds, setLocallyQueuedCommentRunIds] = useState<Map<string, string>>(() => new Map());
   const [pendingCommentComposerFocusKey, setPendingCommentComposerFocusKey] = useState(0);
@@ -1829,9 +1831,28 @@ export function IssueDetail() {
       });
     },
   });
+  // Approving or requesting changes on an active execution stage requires a
+  // comment, so a bare status change would be rejected with a 422. When the
+  // current user is the stage participant, collect the decision comment first.
+  const stageDecisionRequiredFor = useCallback((data: Record<string, unknown>): "done" | "in_progress" | null => {
+    const keys = Object.keys(data);
+    if (keys.length !== 1 || keys[0] !== "status") return null;
+    const nextStatus = data.status;
+    if (nextStatus !== "done" && nextStatus !== "in_progress") return null;
+    if (issue?.status !== "in_review" || issue.executionState?.status !== "pending") return null;
+    const participant = issue.executionState.currentParticipant;
+    if (!participant || participant.type !== "user" || !currentUserId) return null;
+    return participant.userId === currentUserId ? nextStatus : null;
+  }, [issue, currentUserId]);
   const handleIssuePropertiesUpdate = useCallback((data: Record<string, unknown>) => {
+    const decision = stageDecisionRequiredFor(data);
+    if (decision) {
+      setStageDecisionComment("");
+      setStageDecisionStatus(decision);
+      return;
+    }
     updateIssue.mutate(data);
-  }, [updateIssue.mutate]);
+  }, [stageDecisionRequiredFor, updateIssue.mutate]);
 
   const updateChildIssue = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) => issuesApi.update(id, data),
@@ -3204,7 +3225,7 @@ export function IssueDetail() {
           <StatusIcon
             status={issue.status}
             blockerAttention={issue.blockerAttention}
-            onChange={(status) => updateIssue.mutate({ status })}
+            onChange={(status) => handleIssuePropertiesUpdate({ status })}
           />
           <PriorityIcon
             priority={issue.priority}
@@ -4034,6 +4055,51 @@ export function IssueDetail() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={stageDecisionStatus !== null} onOpenChange={(open) => { if (!open) setStageDecisionStatus(null); }}>
+        <DialogContent className="sm:max-w-[480px]">
+          <DialogHeader>
+            <DialogTitle>
+              {stageDecisionStatus === "done" ? "Approve this issue" : "Request changes"}
+            </DialogTitle>
+            <DialogDescription>
+              You are the active {issue.executionState?.currentStageType === "review" ? "reviewer" : "approver"} for this issue.
+              A comment is required to record this decision.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-1.5">
+            <label className="text-xs text-muted-foreground">Comment</label>
+            <Textarea
+              value={stageDecisionComment}
+              onChange={(event) => setStageDecisionComment(event.target.value)}
+              placeholder={stageDecisionStatus === "done"
+                ? "Why is this approved?"
+                : "What needs to change before this can be approved?"}
+              className="min-h-[88px]"
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setStageDecisionStatus(null)} disabled={updateIssue.isPending}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                if (!stageDecisionStatus) return;
+                updateIssue.mutate(
+                  { status: stageDecisionStatus, comment: stageDecisionComment.trim() },
+                  { onSuccess: () => setStageDecisionStatus(null) },
+                );
+              }}
+              disabled={updateIssue.isPending || !stageDecisionComment.trim()}
+            >
+              {updateIssue.isPending
+                ? "Saving..."
+                : stageDecisionStatus === "done" ? "Approve" : "Request changes"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Mobile properties drawer */}
       <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>
         <SheetContent side="bottom" className="max-h-[85dvh] pb-[env(safe-area-inset-bottom)]">
@@ -4046,7 +4112,7 @@ export function IssueDetail() {
                 issue={issue}
                 childIssues={childIssues}
                 onAddSubIssue={openNewSubIssue}
-                onUpdate={(data) => updateIssue.mutate(data)}
+                onUpdate={handleIssuePropertiesUpdate}
                 inline
               />
             </div>
