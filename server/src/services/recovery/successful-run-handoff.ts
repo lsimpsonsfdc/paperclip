@@ -323,6 +323,7 @@ export function decideSuccessfulRunHandoff(input: {
   hasActiveExecutionPath: boolean;
   hasQueuedWake: boolean;
   hasPendingInteractionOrApproval: boolean;
+  hasLiveNonTerminalChildren: boolean;
   hasExplicitBlockerPath: boolean;
   hasOpenRecoveryIssue: boolean;
   hasPauseHold: boolean;
@@ -358,6 +359,12 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.hasQueuedWake) return { kind: "skip", reason: "issue already has a queued or deferred wake" };
   if (input.hasPendingInteractionOrApproval) {
     return { kind: "skip", reason: "pending interaction or approval owns the next action" };
+  }
+  if (input.hasLiveNonTerminalChildren) {
+    // Tracking/epic parents wait in `in_progress` with no self-blockers; the
+    // `issue_children_completed` wake fires once every child reaches a terminal
+    // status, so that wake is the continuation path (SSO-15401).
+    return { kind: "skip", reason: "live child issues own the continuation path" };
   }
   if (input.hasExplicitBlockerPath) return { kind: "skip", reason: "explicit blocker path owns the next action" };
   if (input.hasOpenRecoveryIssue) return { kind: "skip", reason: "open recovery issue owns the ambiguity" };
