@@ -36,6 +36,7 @@ import type { WorkspaceOperationRecorder } from "./workspace-operations.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { logActivity } from "./activity-log.js";
 import { readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
+import { logger } from "../middleware/logger.js";
 
 export function resolveShell(): string {
   const fallback = process.platform === "win32" ? "sh" : "/bin/sh";
@@ -2183,6 +2184,13 @@ async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
 
+// Plain string comparison on resolved paths, deliberately not realpath-based: this runs on
+// every heartbeat's happy path and must stay O(1) with no extra stat/git calls.
+function sameResolvedCwd(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left || !right) return false;
+  return path.resolve(left) === path.resolve(right);
+}
+
 async function resolvePathForWorktreeComparison(value: string): Promise<string> {
   const resolved = path.resolve(value);
   return fs.realpath(resolved).then((realPath) => path.resolve(realPath)).catch(() => resolved);
@@ -2944,6 +2952,25 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
 
   if (strategy !== "git_worktree") {
     if (!await directoryExists(cwd)) {
+      return null;
+    }
+    // The resolved base only counts as a verified project checkout when its source is
+    // "project_primary" (resolveWorkspaceForRun stat'd the configured project cwd this run).
+    // If the persisted row's cwd has drifted from that resolved path — e.g. it still points at
+    // a stale agent-home fallback from before a resolution bug was fixed — directoryExists()
+    // alone would keep re-accepting it forever. Invalidate and force realizeExecutionWorkspace
+    // to re-derive the correct cwd instead. This is a plain path comparison, no extra I/O.
+    if (input.base.source === "project_primary" && !sameResolvedCwd(cwd, input.base.baseCwd)) {
+      logger.warn(
+        {
+          executionWorkspaceId: input.workspace.id ?? null,
+          projectId: input.base.projectId,
+          projectWorkspaceId: input.base.workspaceId,
+          persistedCwd: cwd,
+          resolvedProjectCwd: input.base.baseCwd,
+        },
+        "ensurePersistedExecutionWorkspaceAvailable: persisted cwd no longer matches the resolved project workspace path; invalidating",
+      );
       return null;
     }
     return realized;

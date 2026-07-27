@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -15,8 +15,10 @@ import {
   buildExplicitResumeSessionOverride,
   buildEffectiveRunSessionConfigMetadata,
   buildEffectiveRunWorkspaceConfigMetadata,
+  buildProjectWorkspaceUnavailableFallback,
   buildWorkspaceConfigFreshnessOperation,
   deriveTaskKeyWithHeartbeatFallback,
+  ensureManagedProjectWorkspace,
   extractWakeCommentIds,
   formatRuntimeWorkspaceWarningLog,
   mergeExecutionWorkspaceMetadataForPersistence,
@@ -43,6 +45,7 @@ import {
   shouldResetTaskSessionForWake,
   type ResolvedWorkspaceForRun,
 } from "../services/heartbeat.ts";
+import { ensurePersistedExecutionWorkspaceAvailable } from "../services/workspace-runtime.ts";
 import type { TrustPresetResolution } from "../services/trust-preset-resolver.ts";
 
 const execFile = promisify(execFileCallback);
@@ -2536,6 +2539,266 @@ describe("prioritizeProjectWorkspaceCandidatesForRun", () => {
     expect(
       prioritizeProjectWorkspaceCandidatesForRun(rows, "workspace-9").map((row) => row.id),
     ).toEqual(["workspace-1", "workspace-2"]);
+  });
+});
+
+// Regression guard: every configured project workspace path was unreachable, so resolveWorkspaceForRun
+// falls back to the agent's ad-hoc home directory. The result must be labelled "agent_home", not
+// "project_primary" — mislabeling it lets a git-sensitive adapter launch from the wrong cwd
+// because assertGitWorktreeBaseWorkspaceReady and friends only guard on source === "agent_home".
+describe("buildProjectWorkspaceUnavailableFallback", () => {
+  it("labels the fallback agent_home, not project_primary, when configured project cwds are unreachable", () => {
+    const result = buildProjectWorkspaceUnavailableFallback({
+      resolvedProjectId: "project-1",
+      fallbackCwd: "/tmp/agent-fallback",
+      preferredWorkspaceWarning: null,
+      missingProjectCwds: ["/tmp/missing-project-cwd"],
+      hasConfiguredProjectCwd: true,
+      firstProjectWorkspaceRow: { id: "workspace-1", repoUrl: "https://github.com/example/repo.git", repoRef: "main" },
+      workspaceHints: [],
+    });
+
+    expect(result.source).toBe("agent_home");
+    expect(result.cwd).toBe("/tmp/agent-fallback");
+    expect(result.projectId).toBe("project-1");
+    // The unreachable workspace's id/repo metadata is preserved so downstream mismatch checks
+    // (e.g. assertGitSensitiveAdapterWorkspaceValid's project_workspace_mismatch) still see what
+    // this run *expected*, even though it fell back to the agent's home directory.
+    expect(result.workspaceId).toBe("workspace-1");
+    expect(result.repoUrl).toBe("https://github.com/example/repo.git");
+    expect(result.warnings).toEqual([
+      'Project workspace path "/tmp/missing-project-cwd" is not available yet. Using fallback workspace "/tmp/agent-fallback" for this run.',
+    ]);
+  });
+
+  it("labels the fallback agent_home when the project workspace has no cwd configured at all", () => {
+    const result = buildProjectWorkspaceUnavailableFallback({
+      resolvedProjectId: "project-1",
+      fallbackCwd: "/tmp/agent-fallback",
+      preferredWorkspaceWarning: null,
+      missingProjectCwds: [],
+      hasConfiguredProjectCwd: false,
+      firstProjectWorkspaceRow: null,
+      workspaceHints: [],
+    });
+
+    expect(result.source).toBe("agent_home");
+    expect(result.workspaceId).toBeNull();
+    expect(result.warnings).toEqual([
+      'Project workspace has no local cwd configured. Using fallback workspace "/tmp/agent-fallback" for this run.',
+    ]);
+  });
+
+  it("feeds assertGitWorktreeBaseWorkspaceReady a source that actually triggers the agent_home guard", async () => {
+    const fallback = buildProjectWorkspaceUnavailableFallback({
+      resolvedProjectId: "project-1",
+      fallbackCwd: resolveDefaultAgentWorkspaceDir("agent-1"),
+      preferredWorkspaceWarning: null,
+      missingProjectCwds: ["/tmp/missing-project-cwd"],
+      hasConfiguredProjectCwd: true,
+      firstProjectWorkspaceRow: { id: "workspace-1", repoUrl: null, repoRef: null },
+      workspaceHints: [],
+    });
+
+    await expect(assertGitWorktreeBaseWorkspaceReady({
+      requestedExecutionWorkspaceMode: "isolated_workspace",
+      config: { workspaceStrategy: { type: "git_worktree" } },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-1",
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        executionWorkspaceId: null,
+        executionWorkspacePreference: "isolated_workspace",
+      },
+      base: fallback,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          reason: "git_worktree_base_agent_home",
+        }),
+      },
+    });
+  });
+});
+
+// Regression guard: ensurePersistedExecutionWorkspaceAvailable's only non-worktree freshness check used
+// to be directoryExists(cwd). A persisted row whose cwd had drifted away from the currently
+// resolved project workspace path (e.g. it still pointed at a stale agent-home fallback from
+// before the source-labelling bug above was fixed) would be re-accepted forever, because the
+// fallback directory is always mkdir -p'd into existence.
+describe("ensurePersistedExecutionWorkspaceAvailable persisted cwd validation", () => {
+  function buildBaseAndWorkspace(overrides: { baseCwd: string; persistedCwd: string; source?: "project_primary" | "task_session" | "agent_home" }) {
+    return {
+      base: {
+        baseCwd: overrides.baseCwd,
+        source: overrides.source ?? "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: null,
+      },
+      workspace: {
+        id: "execws-1",
+        mode: "shared_workspace",
+        strategyType: "project_primary",
+        cwd: overrides.persistedCwd,
+        providerRef: null,
+        projectId: "project-1",
+        projectWorkspaceId: "workspace-1",
+        repoUrl: null,
+        baseRef: null,
+        branchName: null,
+      },
+      issue: null,
+      agent: { id: "agent-1", name: "Test Agent", companyId: "company-1" },
+    };
+  }
+
+  it("invalidates a persisted project_primary cwd that no longer matches the resolved project workspace path", async () => {
+    const resolvedProjectCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-resolved-project-"));
+    const stalePersistedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-stale-persisted-"));
+    try {
+      const result = await ensurePersistedExecutionWorkspaceAvailable(
+        buildBaseAndWorkspace({ baseCwd: resolvedProjectCwd, persistedCwd: stalePersistedCwd }),
+      );
+
+      expect(result).toBeNull();
+    } finally {
+      await fs.rm(resolvedProjectCwd, { recursive: true, force: true });
+      await fs.rm(stalePersistedCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a persisted project_primary cwd that still matches the resolved project workspace path", async () => {
+    const projectCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-resolved-project-match-"));
+    try {
+      const result = await ensurePersistedExecutionWorkspaceAvailable(
+        buildBaseAndWorkspace({ baseCwd: projectCwd, persistedCwd: projectCwd }),
+      );
+
+      expect(result?.cwd).toBe(projectCwd);
+    } finally {
+      await fs.rm(projectCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not invalidate a persisted cwd when the base did not resolve to a verified project checkout", async () => {
+    // source: "task_session" means resolveWorkspaceForRun did not verify baseCwd against a
+    // configured project workspace this run, so it is not a meaningful comparison target.
+    const resolvedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-task-session-base-"));
+    const persistedCwd = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-task-session-persisted-"));
+    try {
+      const result = await ensurePersistedExecutionWorkspaceAvailable(
+        buildBaseAndWorkspace({ baseCwd: resolvedCwd, persistedCwd, source: "task_session" }),
+      );
+
+      expect(result?.cwd).toBe(persistedCwd);
+    } finally {
+      await fs.rm(resolvedCwd, { recursive: true, force: true });
+      await fs.rm(persistedCwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// Regression guard: Paperclip seeds .paperclip/design/*.md into a managed project workspace directory
+// before it is ever cloned. The old "does readdir() return any entries" check treated that seeded
+// directory as "real content already here" and skipped the clone forever, leaving the agent in a
+// source-less working directory.
+describe("ensureManagedProjectWorkspace clone-into-dir-containing-only-.paperclip", () => {
+  it("clones into a managed workspace dir that only contains a platform-seeded .paperclip folder, preserving it", async () => {
+    const priorHome = process.env.PAPERCLIP_HOME;
+    const sandboxHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-managed-clone-home-"));
+    const sourceRepo = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-managed-clone-source-"));
+    try {
+      process.env.PAPERCLIP_HOME = sandboxHome;
+
+      await runGit(sourceRepo, ["init"]);
+      await runGit(sourceRepo, ["config", "user.email", "paperclip@example.com"]);
+      await runGit(sourceRepo, ["config", "user.name", "Paperclip Test"]);
+      await fs.writeFile(path.join(sourceRepo, "README.md"), "hello\n", "utf8");
+      await runGit(sourceRepo, ["add", "README.md"]);
+      await runGit(sourceRepo, ["commit", "-m", "Initial commit"]);
+
+      const repoUrl = `file://${sourceRepo}`;
+      const repoName = path.basename(sourceRepo);
+      const managedCwd = resolveManagedProjectWorkspaceDir({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoName,
+      });
+
+      // Simulate Paperclip's own design-anchor seeding into the not-yet-cloned managed folder.
+      await fs.mkdir(path.join(managedCwd, ".paperclip", "design"), { recursive: true });
+      await fs.writeFile(path.join(managedCwd, ".paperclip", "design", "brand.md"), "seeded\n", "utf8");
+
+      const result = await ensureManagedProjectWorkspace({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoUrl,
+      });
+
+      expect(result.warning).toBeNull();
+      expect(result.cwd).toBe(managedCwd);
+      await expect(fs.stat(path.join(managedCwd, ".git")).then((s) => s.isDirectory())).resolves.toBe(true);
+      await expect(fs.readFile(path.join(managedCwd, "README.md"), "utf8")).resolves.toBe("hello\n");
+      // The platform-seeded content must survive the clone, not get clobbered by it.
+      await expect(fs.readFile(path.join(managedCwd, ".paperclip", "design", "brand.md"), "utf8")).resolves.toBe("seeded\n");
+    } finally {
+      if (priorHome === undefined) {
+        delete process.env.PAPERCLIP_HOME;
+      } else {
+        process.env.PAPERCLIP_HOME = priorHome;
+      }
+      await fs.rm(sandboxHome, { recursive: true, force: true });
+      await fs.rm(sourceRepo, { recursive: true, force: true });
+    }
+  });
+
+  it("still skips the clone and warns when the existing dir has real, non-platform content", async () => {
+    const priorHome = process.env.PAPERCLIP_HOME;
+    const sandboxHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-managed-clone-home-real-"));
+    const sourceRepo = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-managed-clone-source-real-"));
+    try {
+      process.env.PAPERCLIP_HOME = sandboxHome;
+
+      await runGit(sourceRepo, ["init"]);
+      await runGit(sourceRepo, ["config", "user.email", "paperclip@example.com"]);
+      await runGit(sourceRepo, ["config", "user.name", "Paperclip Test"]);
+      await fs.writeFile(path.join(sourceRepo, "README.md"), "hello\n", "utf8");
+      await runGit(sourceRepo, ["add", "README.md"]);
+      await runGit(sourceRepo, ["commit", "-m", "Initial commit"]);
+
+      const repoUrl = `file://${sourceRepo}`;
+      const repoName = path.basename(sourceRepo);
+      const managedCwd = resolveManagedProjectWorkspaceDir({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoName,
+      });
+
+      await fs.mkdir(managedCwd, { recursive: true });
+      await fs.writeFile(path.join(managedCwd, "unrelated-file.txt"), "not a git checkout\n", "utf8");
+
+      const result = await ensureManagedProjectWorkspace({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoUrl,
+      });
+
+      expect(result.cwd).toBe(managedCwd);
+      expect(result.warning).toContain("already exists but is not a git checkout");
+      await expect(fs.stat(path.join(managedCwd, ".git")).catch(() => null)).resolves.toBeNull();
+    } finally {
+      if (priorHome === undefined) {
+        delete process.env.PAPERCLIP_HOME;
+      } else {
+        process.env.PAPERCLIP_HOME = priorHome;
+      }
+      await fs.rm(sandboxHome, { recursive: true, force: true });
+      await fs.rm(sourceRepo, { recursive: true, force: true });
+    }
   });
 });
 
