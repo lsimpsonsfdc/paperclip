@@ -201,6 +201,13 @@ operator's inbox rather than making one.
 - `403` if the interaction was created by a different agent.
 - `409` if the interaction is no longer `pending`.
 - No continuation wake fires: the creator is the one withdrawing.
+- The withdrawal note is written into the thread as a **system notice**, not as
+  the withdrawing agent. Withdraw is gated on issue *read* access, which is far
+  broader than comment access, so authoring the note as the agent would be a
+  comment channel into any issue that agent can see.
+- **Use a fresh `idempotencyKey` when replacing a withdrawn ask.** The
+  idempotency unique index has no status predicate, so re-creating with the same
+  key returns the already-withdrawn interaction instead of a new pending one.
 
 ### Automatic Retirement
 
@@ -224,6 +231,12 @@ scoped to withhold. Send `dryRun: true` first — it reports the exact matched s
 (`matchedCount`, `matched[]`) without writing. In `explicit` mode a pair whose
 `interactionId` does not actually live on the named `issueId` is dropped, so a
 stale list cannot retire an unrelated interaction.
+
+`explicit` mode can target an interaction on a still-open issue, so it is
+recorded as `retirement.kind === "board_bulk_retired"` (never `issue_closed`,
+which would assert something false about the parent), and any assignee still
+parked on the retired decision is woken — otherwise the cleanup would trade a
+noisy inbox for a silently stalled agent.
 
 ## Documents
 

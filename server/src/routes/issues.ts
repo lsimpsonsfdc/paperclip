@@ -1902,6 +1902,14 @@ function queueResolvedInteractionContinuationWakeup(input: {
   workspaceRefreshReason?: string | null;
   newlyResolvedItemIds?: string[];
   idempotencyKey?: string | null;
+  /**
+   * Opt in to waking on an `expired` interaction. Off by default because the
+   * usual expiry cause is a superseding board comment, which already wakes the
+   * assignee — a second wake would double-fire. A board bulk retirement has no
+   * such comment, so without this the parked assignee is never told its
+   * decision is not coming and stalls indefinitely.
+   */
+  wakeOnExpired?: boolean;
 }) {
   if (
     input.interaction.continuationPolicy !== "wake_assignee"
@@ -1911,7 +1919,7 @@ function queueResolvedInteractionContinuationWakeup(input: {
     input.interaction.continuationPolicy === "wake_assignee_on_accept"
     && input.interaction.status !== "accepted"
   ) return;
-  if (input.interaction.status === "expired") return;
+  if (input.interaction.status === "expired" && input.wakeOnExpired !== true) return;
   if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status)) return;
 
   const forceFreshSession = input.forceFreshSession === true;
@@ -2658,6 +2666,12 @@ export function issueRoutes(
         logger.warn({ err, issueId: issue.id }, "task watchdog evaluation hook failed");
       });
   }
+
+  /**
+   * Cap on the agent-supplied withdrawal reason echoed into the thread note.
+   * The full text is always preserved on `result.retirement.reason`.
+   */
+  const WITHDRAWAL_NOTE_REASON_LIMIT = 500;
 
   async function sourceTrustForActorWrite(
     issue: { id: string; companyId: string; projectId?: string | null; executionPolicy?: unknown },
@@ -9711,21 +9725,36 @@ export function issueRoutes(
       );
 
       const reason = interaction.result?.retirement?.reason ?? null;
-      // The reason has to land in the thread, not just the row: the operator
-      // saw the ask appear in their inbox and needs to see why it vanished.
+      // The reason has to land in the thread, not just the row: the operator saw
+      // the ask appear in their inbox and needs to see why it vanished.
+      //
+      // Written as a SYSTEM notice, not as the withdrawing actor. Withdraw is
+      // gated on `issue:read`, which every same-company agent holds, while
+      // `issue:comment` is materially narrower — authoring this as the agent
+      // would hand any same-company agent a comment channel into any issue it
+      // can see, bypassing `assertAgentIssueCommentAllowed`. A lifecycle record
+      // is what this is, so a lifecycle author is also the accurate one. The
+      // agent-supplied reason is truncated here (the full text stays on
+      // `result.retirement.reason`) so the note cannot be used as a bulk
+      // free-text channel.
       let withdrawalComment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
       try {
+        const truncatedReason = reason && reason.length > WITHDRAWAL_NOTE_REASON_LIMIT
+          ? `${reason.slice(0, WITHDRAWAL_NOTE_REASON_LIMIT)}…`
+          : reason;
         withdrawalComment = await svc.addComment(
           issue.id,
           `Withdrew the pending ${interaction.kind} interaction${
             interaction.title ? ` "${interaction.title}"` : ""
-          }. Reason: ${reason ?? "(none given)"}`,
+          }. Reason: ${truncatedReason ?? "(none given)"}`,
+          { runId: actor.runId },
           {
-            agentId: actor.agentId ?? undefined,
-            userId: actor.actorType === "user" ? actor.actorId : undefined,
-            runId: actor.runId,
+            authorType: "system",
+            presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+            // Fails closed: a quarantined run's note is tagged as such rather
+            // than landing untagged and reading as trusted to later agents.
+            sourceTrust: await sourceTrustForActorWrite(issue, actor),
           },
-          { authorType: actor.agentId ? "agent" : "user" },
         );
       } catch (err) {
         // A failed thread note must not roll back an already-withdrawn row —
@@ -9787,6 +9816,27 @@ export function issueRoutes(
           : { mode: "closed_issues" },
         { reason: body.reason, dryRun: body.dryRun },
       );
+
+      if (!result.dryRun) {
+        // An `explicit` pass can retire a decision on a still-open issue whose
+        // assignee is parked waiting for it. Nothing else will tell that agent
+        // the answer is not coming, so wake it here — otherwise the cleanup
+        // trades a noisy inbox for a silently stalled agent.
+        for (const retired of result.retired ?? []) {
+          queueResolvedInteractionContinuationWakeup({
+            heartbeat,
+            issue: {
+              id: retired.issueId,
+              assigneeAgentId: retired.issue.assigneeAgentId,
+              status: retired.issue.status,
+            },
+            interaction: retired,
+            actor,
+            source: "issue.interaction.bulk_retire",
+            wakeOnExpired: true,
+          });
+        }
+      }
 
       if (!result.dryRun && result.retiredCount > 0) {
         await logActivity(db, {

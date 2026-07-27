@@ -724,10 +724,14 @@ export const suggestTasksResultCreatedTaskSchema = z.object({
  * `withdrawn_by_creator` pairs with interaction status `withdrawn` (the author
  * agent pulled its own ask). `issue_closed` pairs with status `expired` (the
  * parent issue reached done/cancelled, so the ask is moot).
+ * `board_bulk_retired` pairs with status `expired` and marks an explicit board
+ * cleanup — it must not be conflated with `issue_closed`, which asserts
+ * something about the parent issue that an explicit bulk pass does not.
  */
 export const issueThreadInteractionRetirementKindSchema = z.enum([
   "withdrawn_by_creator",
   "issue_closed",
+  "board_bulk_retired",
 ]);
 export type IssueThreadInteractionRetirementKind =
   z.infer<typeof issueThreadInteractionRetirementKindSchema>;

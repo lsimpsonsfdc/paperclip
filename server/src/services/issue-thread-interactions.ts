@@ -2245,7 +2245,11 @@ export function issueThreadInteractionService(db: Db) {
         );
 
       const candidateRows = await db
-        .select({ interaction: issueThreadInteractions, issueStatus: issues.status })
+        .select({
+          interaction: issueThreadInteractions,
+          issueStatus: issues.status,
+          issueAssigneeAgentId: issues.assigneeAgentId,
+        })
         .from(issueThreadInteractions)
         .innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
         .where(candidateConditions)
@@ -2272,14 +2276,26 @@ export function issueThreadInteractionService(db: Db) {
       }
 
       const now = new Date();
-      const retired: IssueThreadInteraction[] = [];
+      // Retired rows are returned with their parent issue's live status and
+      // assignee so the caller can wake an assignee still parked on a decision
+      // that will now never arrive (only possible in `explicit` mode, which can
+      // target an interaction on an OPEN issue).
+      const retired: Array<
+        IssueThreadInteraction & { issue: { status: string; assigneeAgentId: string | null } }
+      > = [];
       const touchedIssueIds = new Set<string>();
       for (const row of candidates) {
+        // The retirement kind must describe what actually happened. An explicit
+        // board pass can target an interaction on an OPEN issue, so labelling it
+        // `issue_closed` would assert something false about the parent.
+        const retirementKind = scope.mode === "closed_issues"
+          ? "issue_closed" as const
+          : "board_bulk_retired" as const;
         const reason = opts.reason
           ?? (scope.mode === "closed_issues"
             ? `Issue reached terminal status "${row.issueStatus}"; the decision is no longer needed.`
             : "Retired by the board in a bulk decision-backlog cleanup.");
-        const retirement = buildRetirement({ kind: "issue_closed", reason, now });
+        const retirement = buildRetirement({ kind: retirementKind, reason, now });
         const [updated] = await db
           .update(issueThreadInteractions)
           .set({
@@ -2296,7 +2312,10 @@ export function issueThreadInteractionService(db: Db) {
           ))
           .returning();
         if (updated) {
-          retired.push(hydrateInteraction(updated));
+          retired.push({
+            ...hydrateInteraction(updated),
+            issue: { status: row.issueStatus, assigneeAgentId: row.issueAssigneeAgentId ?? null },
+          });
           touchedIssueIds.add(updated.issueId);
         }
       }
@@ -2309,6 +2328,7 @@ export function issueThreadInteractionService(db: Db) {
         matchedCount: matched.length,
         retiredCount: retired.length,
         matched,
+        retired,
       };
     },
   };

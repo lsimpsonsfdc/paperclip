@@ -1351,11 +1351,18 @@ describe.sequential("issue thread interaction routes", () => {
     );
     // The reason has to reach the thread, not just the row: the operator saw
     // the ask appear and needs to see why it vanished.
+    // Authored as a SYSTEM notice, never as the agent: withdraw is gated on
+    // `issue:read`, which is far broader than `issue:comment`, so authoring it
+    // as the agent would hand any same-company agent a comment channel into any
+    // issue it can see.
     expect(mockIssueService.addComment).toHaveBeenCalledWith(
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       expect.stringContaining("Superseded by a newer ask."),
-      expect.objectContaining({ agentId: CREATED_AGENT_ID }),
-      expect.objectContaining({ authorType: "agent" }),
+      expect.not.objectContaining({ agentId: CREATED_AGENT_ID }),
+      expect.objectContaining({
+        authorType: "system",
+        presentation: expect.objectContaining({ kind: "system_notice" }),
+      }),
     );
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -1408,6 +1415,77 @@ describe.sequential("issue thread interaction routes", () => {
     expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
     expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
     expect(mockInteractionService.cancelQuestions).not.toHaveBeenCalled();
+  });
+
+  it("wakes an assignee still parked on a decision retired by a board bulk pass", async () => {
+    // An explicit pass can retire a decision on a still-open issue. Nothing
+    // else tells that agent the answer is not coming, so without this wake the
+    // cleanup trades a noisy inbox for a silently stalled agent.
+    mockInteractionService.retireInteractionsBulk.mockResolvedValueOnce({
+      dryRun: false,
+      matchedCount: 1,
+      retiredCount: 1,
+      matched: [],
+      retired: [{
+        id: "interaction-2",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "expired",
+        continuationPolicy: "wake_assignee",
+        sourceCommentId: "comment-2",
+        sourceRunId: "run-2",
+        payload: { version: 1, prompt: "Ship it?" },
+        result: {
+          version: 1,
+          outcome: "retired",
+          retirement: { version: 1, kind: "board_bulk_retired", reason: "Backlog cleanup.", retiredAt: "2026-04-20T12:05:00.000Z" },
+        },
+        issue: { status: "in_progress", assigneeAgentId: ASSIGNEE_AGENT_ID },
+      }],
+    });
+
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issue-interactions/retire")
+      .send({ mode: "explicit", targets: [{ issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", interactionId: "22222222-2222-4222-8222-222222222222" }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.retiredCount).toBe(1);
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        payload: expect.objectContaining({ interactionId: "interaction-2", interactionStatus: "expired" }),
+      }),
+    );
+  });
+
+  it("does not wake when a bulk pass only retires decisions on closed issues", async () => {
+    mockInteractionService.retireInteractionsBulk.mockResolvedValueOnce({
+      dryRun: false,
+      matchedCount: 1,
+      retiredCount: 1,
+      matched: [],
+      retired: [{
+        id: "interaction-3",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: "expired",
+        continuationPolicy: "wake_assignee",
+        payload: { version: 1, prompt: "Ship it?" },
+        result: { version: 1, outcome: "retired" },
+        issue: { status: "done", assigneeAgentId: ASSIGNEE_AGENT_ID },
+      }],
+    });
+
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issue-interactions/retire")
+      .send({ mode: "closed_issues" });
+
+    expect(res.status).toBe(200);
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
   it("rejects agent actors from the board-only bulk retire endpoint", async () => {

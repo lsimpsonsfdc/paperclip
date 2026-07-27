@@ -994,7 +994,10 @@ export interface SuggestTasksResultCreatedTask {
   parentIdentifier?: string | null;
 }
 
-export type IssueThreadInteractionRetirementKind = "withdrawn_by_creator" | "issue_closed";
+export type IssueThreadInteractionRetirementKind =
+  | "withdrawn_by_creator"
+  | "issue_closed"
+  | "board_bulk_retired";
 
 /**
  * Recorded on the `result` of any interaction retired without an operator

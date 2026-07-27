@@ -1385,6 +1385,32 @@ function RequestConfirmationResolution({
     );
   }
 
+  // Retired without an operator decision — either the creator withdrew the ask
+  // or the parent issue closed. Handled before the `expired` branch below,
+  // which renders a binary comment-vs-target-change explanation that would
+  // otherwise state something factually untrue about a retired confirmation.
+  const retirement = interaction.result?.retirement ?? null;
+  if (interaction.status === "withdrawn" || retirement) {
+    const withdrawnByCreator = retirement?.kind === "withdrawn_by_creator";
+    return (
+      <div className="space-y-2 rounded-sm border border-amber-500/60 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-100">
+        <div className="text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow) text-amber-700">
+          {withdrawnByCreator ? "Withdrawn" : "Retired"}
+        </div>
+        <p className="leading-6">
+          {withdrawnByCreator
+            ? "The agent that asked withdrew this request before it was resolved. No decision was recorded."
+            : "This request was retired without a decision."}
+        </p>
+        {retirement?.reason ? (
+          <div className="rounded-sm border-l-2 border-amber-500/70 bg-amber-500/10 px-3 py-2 leading-6">
+            <MarkdownBody>{retirement.reason}</MarkdownBody>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
   if (interaction.status === "expired") {
     const expiredByComment = outcome === "superseded_by_comment";
     const expiredByTargetChange = outcome === "stale_target";
@@ -2737,6 +2763,11 @@ function RequestItemVerdictsCard({
   const progress = getItemVerdictProgress({ payload, result: interaction.result });
   const isTerminal = interaction.status !== "pending";
   const isExpired = interaction.status === "expired";
+  // A withdrawn review is terminal but not "expired", so without this it would
+  // render no resolution notice at all — a terminal card with no explanation of
+  // the reason that was mandatorily collected.
+  const retirement = interaction.result?.retirement ?? null;
+  const isRetired = interaction.status === "withdrawn" || retirement != null;
   const isComplete = interaction.status === "answered" || progress.decided === progress.total;
 
   const draftEntries = [...drafts.entries()];
@@ -2831,8 +2862,27 @@ function RequestItemVerdictsCard({
         ) : null}
       </div>
 
+      {/* Retired without a decision — withdrawn by the creator, or the issue closed. */}
+      {isRetired ? (
+        <div className="rounded-sm border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100">
+          <div className="flex items-center gap-2 font-medium">
+            <AlertTriangle className="h-4 w-4" aria-hidden />
+            {retirement?.kind === "withdrawn_by_creator"
+              ? "The agent that asked withdrew this review."
+              : "This review was retired without a decision."}
+          </div>
+          {retirement?.reason ? <p className="mt-1 text-xs leading-5">{retirement.reason}</p> : null}
+          {progress.decided > 0 ? (
+            <p className="mt-1 text-xs leading-5">
+              {progress.decided === 1 ? "1 item was" : `${progress.decided} items were`} already applied and cannot be
+              reverted.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
       {/* Stale / superseded notice (S6) */}
-      {isExpired ? (
+      {isExpired && !isRetired ? (
         <div className="rounded-sm border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100">
           <div className="flex items-center gap-2 font-medium">
             <AlertTriangle className="h-4 w-4" aria-hidden />
