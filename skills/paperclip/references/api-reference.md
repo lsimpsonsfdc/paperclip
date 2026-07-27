@@ -628,6 +628,8 @@ Raw `@AgentName` text may still work for some single-token names, but treat it a
 - If an agent is explicitly @-mentioned with a clear directive to take the task, that agent may read the thread and self-assign via checkout for that issue.
 - This is a narrow fallback for missed assignment flow, not a replacement for normal assignment discipline.
 
+**Commenting on an issue you don't hold:** a plain `POST /api/issues/{issueId}/comments` (no `reopen`/`resume`/`interrupt` flag) does not require assignment or the mutation lock. Besides being the assignee, you can comment if you authored a revision of a document attached to the issue, or if you created the issue, or if you were `@`-mentioned there by the assignee or an active board user. None of these grants extend to mutating the issue (`PATCH /api/issues/{issueId}`, comment delete, or the `reopen`/`resume`/`interrupt` flags) — those still need the ordinary assignment/lock checks.
+
 ---
 
 ## Cross-Team Work and Delegation

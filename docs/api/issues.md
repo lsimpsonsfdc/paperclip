@@ -121,6 +121,14 @@ POST /api/issues/{issueId}/comments
 
 @-mentions (`@AgentName`) in comments trigger heartbeats for the mentioned agent.
 
+**Commenting on an issue you don't hold.** Posting a plain comment (no `reopen`/`resume`/`interrupt` flag) does not require holding the issue's assignment or mutation lock. A same-company agent may comment on any issue it is the assignee of, or if any of the following hold:
+
+- it authored at least one revision of a document attached to the issue (`allow_issue_authorship_grant`);
+- it created the issue (`allow_issue_creator_grant`);
+- it was `@`-mentioned by the issue's assignee, or by an active board user, in an existing comment on the issue (`allow_issue_mention_grant`).
+
+These grants are comment-only — they do not extend to `PATCH /issues/{issueId}`, comment delete, or the `reopen`/`resume`/`interrupt` flags on comment create, all of which still require the ordinary mutation-lock checks. Low-trust review runs are unaffected by these grants.
+
 ## Issue-Thread Interactions
 
 Interactions are structured cards in the issue thread. Agents create them when a board/user needs to choose tasks, answer questions, or confirm a proposal through the UI instead of hidden markdown conventions.

@@ -4,9 +4,11 @@ import {
   agents,
   authUsers,
   companyMemberships,
+  documentRevisions,
   heartbeatRuns,
   instanceUserRoles,
   issueComments,
+  issueDocuments,
   issues,
   principalPermissionGrants,
   projects,
@@ -102,6 +104,8 @@ export type AuthorizationDecision = {
     | "allow_consented_change"
     | "allow_legacy_agent_creator"
     | "allow_issue_mention_grant"
+    | "allow_issue_authorship_grant"
+    | "allow_issue_creator_grant"
     | "allow_direct_parent_report"
     | "allow_self"
     | "allow_company_agent"
@@ -1381,6 +1385,57 @@ export function authorizationService(db: Db) {
     });
   }
 
+  async function agentAuthoredDocumentRevisionOnIssue(input: {
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .select({ id: documentRevisions.id })
+      .from(issueDocuments)
+      .innerJoin(documentRevisions, eq(documentRevisions.documentId, issueDocuments.documentId))
+      .where(and(
+        eq(issueDocuments.companyId, input.companyId),
+        eq(issueDocuments.issueId, input.issueId),
+        eq(documentRevisions.createdByAgentId, input.actorAgentId),
+      ))
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  function allowIssueAuthorshipGrant(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_issue_authorship_grant",
+      explanation: "Allowed because the actor authored a revision of a document attached to this issue.",
+    });
+  }
+
+  async function agentCreatedIssue(input: {
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }): Promise<boolean> {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.id, input.issueId),
+        eq(issues.companyId, input.companyId),
+        eq(issues.createdByAgentId, input.actorAgentId),
+      ))
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  function allowIssueCreatorGrant(action: AuthorizationAction): AuthorizationDecision {
+    return allow({
+      action,
+      reason: "allow_issue_creator_grant",
+      explanation: "Allowed because the actor created this issue.",
+    });
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -1982,6 +2037,28 @@ export function authorizationService(db: Db) {
         })
       ) {
         return allowIssueMentionGrant(input.action);
+      }
+      if (
+        input.action === "issue:comment" &&
+        resource?.issueId &&
+        await agentAuthoredDocumentRevisionOnIssue({
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allowIssueAuthorshipGrant(input.action);
+      }
+      if (
+        input.action === "issue:comment" &&
+        resource?.issueId &&
+        await agentCreatedIssue({
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allowIssueCreatorGrant(input.action);
       }
     }
     if (

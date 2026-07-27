@@ -19,6 +19,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { authorizationService } from "../services/authorization.js";
+import { documentService } from "../services/documents.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -77,6 +78,7 @@ async function createIssue(
     assigneeAgentId?: string | null;
     originKind?: string | null;
     originId?: string | null;
+    createdByAgentId?: string | null;
   } = {},
 ) {
   return db
@@ -92,6 +94,7 @@ async function createIssue(
       assigneeAgentId: input.assigneeAgentId ?? null,
       originKind: input.originKind ?? "manual",
       originId: input.originId ?? null,
+      createdByAgentId: input.createdByAgentId ?? null,
     })
     .returning()
     .then((rows) => rows[0]!);
@@ -1386,6 +1389,214 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: true,
       reason: "allow_issue_mention_grant",
     });
+  });
+
+  it("allows a non-assignee who authored a document revision on the issue to comment, but not mutate", async () => {
+    const company = await createCompany(db, "DocumentAuthorshipCommentGrant");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const authorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Document authorship comment grant target",
+      assigneeAgentId: ownerAgent.id,
+    });
+    await documentService(db).upsertIssueDocument({
+      issueId: issue.id,
+      key: "shortlist-third-screen",
+      title: "Shortlist — third screen",
+      format: "markdown",
+      body: "# Draft",
+      createdByAgentId: authorAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: authorAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: ownerAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_authorship_grant",
+    });
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("allows the agent that created an issue to comment on it after reassignment, but not mutate", async () => {
+    const company = await createCompany(db, "IssueCreatorCommentGrant");
+    const creatorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Issue creator comment grant target",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: creatorAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_creator_grant",
+    });
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("keeps an unrelated same-company agent's comment denied — no authorship, mention, or creator relationship", async () => {
+    const company = await createCompany(db, "UnrelatedAgentCommentDenied");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const creatorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const unrelatedAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Unrelated agent comment target",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+    await documentService(db).upsertIssueDocument({
+      issueId: issue.id,
+      key: "notes",
+      format: "markdown",
+      body: "# Notes",
+      createdByAgentId: creatorAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: unrelatedAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("denies a document-revision author from another company, even for a document key shared by coincidence", async () => {
+    const companyA = await createCompany(db, "CrossCompanyAuthorshipA");
+    const companyB = await createCompany(db, "CrossCompanyAuthorshipB");
+    const outsideAuthorAgent = await createAgent(db, companyB.id, { role: "engineer" });
+    const assigneeAgent = await createAgent(db, companyA.id, { role: "engineer" });
+    const issue = await createIssue(db, companyA.id, {
+      title: "Cross-company authorship target",
+      assigneeAgentId: assigneeAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = {
+      type: "agent",
+      agentId: outsideAuthorAgent.id,
+      companyId: companyB.id,
+      source: "agent_key",
+    } as const;
+    const resource = {
+      type: "issue",
+      companyId: companyA.id,
+      issueId: issue.id,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_company_boundary",
+    });
+  });
+
+  it("does not extend the authorship or creator comment grants into the low-trust review boundary", async () => {
+    const company = await createCompany(db, "LowTrustAuthorshipUnchanged");
+    const allowedProject = await createProject(db, company.id, "LowTrustAuthorshipAllowed");
+    const targetProject = await createProject(db, company.id, "LowTrustAuthorshipTarget");
+    const ownerAgent = await createAgent(db, company.id, { role: "engineer" });
+    const lowTrustAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: company.id,
+            projectIds: [allowedProject.id],
+          },
+        },
+      },
+    });
+    const issue = await createIssue(db, company.id, {
+      title: "Low-trust authorship boundary target",
+      projectId: targetProject.id,
+      assigneeAgentId: ownerAgent.id,
+      createdByAgentId: lowTrustAgent.id,
+    });
+    await documentService(db).upsertIssueDocument({
+      issueId: issue.id,
+      key: "notes",
+      format: "markdown",
+      body: "# Notes",
+      createdByAgentId: lowTrustAgent.id,
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: lowTrustAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: ownerAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
   it("limits viewer members to read-only visibility actions", async () => {
