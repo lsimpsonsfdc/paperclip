@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notExists, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -10,6 +10,8 @@ import {
   issueComments,
   issueDocuments,
   issues,
+  pipelineCaseDocuments,
+  pipelineDocuments,
   principalPermissionGrants,
   projects,
   userInboxAgentPolicies,
@@ -1398,6 +1400,18 @@ export function authorizationService(db: Db) {
         eq(issueDocuments.companyId, input.companyId),
         eq(issueDocuments.issueId, input.issueId),
         eq(documentRevisions.createdByAgentId, input.actorAgentId),
+        notExists(
+          db
+            .select({ id: pipelineDocuments.id })
+            .from(pipelineDocuments)
+            .where(eq(pipelineDocuments.documentId, issueDocuments.documentId)),
+        ),
+        notExists(
+          db
+            .select({ id: pipelineCaseDocuments.id })
+            .from(pipelineCaseDocuments)
+            .where(eq(pipelineCaseDocuments.documentId, issueDocuments.documentId)),
+        ),
       ))
       .limit(1);
     return rows.length > 0;

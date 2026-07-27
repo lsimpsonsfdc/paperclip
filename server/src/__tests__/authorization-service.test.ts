@@ -9,6 +9,10 @@ import {
   instanceUserRoles,
   issueComments,
   issues,
+  pipelineCaseDocuments,
+  pipelineCases,
+  pipelines,
+  pipelineStages,
   principalPermissionGrants,
   projects,
   userInboxAgentPolicies,
@@ -1597,6 +1601,68 @@ describeEmbeddedPostgres("authorization service", () => {
       action: "issue:comment",
       resource,
     })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
+  it("denies the authorship grant when a document reached issue_documents only via a pipeline-case mirror", async () => {
+    const company = await createCompany(db, "PipelineMirrorAuthorshipDenied");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const pipelineWriterAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Pipeline-mirrored document target",
+      assigneeAgentId: assigneeAgent.id,
+    });
+
+    const [pipeline] = await db
+      .insert(pipelines)
+      .values({ companyId: company.id, key: `pipe-${randomUUID()}`, name: "Pipeline" })
+      .returning();
+    const [stage] = await db
+      .insert(pipelineStages)
+      .values({ pipelineId: pipeline!.id, key: "working", name: "Working", kind: "working", position: 1 })
+      .returning();
+    const [pipelineCase] = await db
+      .insert(pipelineCases)
+      .values({
+        companyId: company.id,
+        pipelineId: pipeline!.id,
+        stageId: stage!.id,
+        caseKey: `case-${randomUUID()}`,
+        title: "Case",
+      })
+      .returning();
+
+    const { document } = await documentService(db).upsertIssueDocument({
+      issueId: issue.id,
+      key: "body",
+      format: "markdown",
+      body: "# Mirrored body",
+      createdByAgentId: pipelineWriterAgent.id,
+    });
+    await db.insert(pipelineCaseDocuments).values({
+      companyId: company.id,
+      caseId: pipelineCase!.id,
+      documentId: document.id,
+      key: "body",
+    });
+
+    const authorization = authorizationService(db);
+    const actor = { type: "agent", agentId: pipelineWriterAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
   });
 
   it("limits viewer members to read-only visibility actions", async () => {
