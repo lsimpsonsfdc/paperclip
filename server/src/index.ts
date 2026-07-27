@@ -751,9 +751,9 @@ export async function startServer(): Promise<StartedServer> {
   
   const runtimeListenHost = config.host;
   // An operator-set PAPERCLIP_API_URL always wins (see choosePrimaryRuntimeApiUrl).
-  // Read it once so PAPERCLIP_RUNTIME_API_URL and PAPERCLIP_API_URL cannot diverge
-  // the way they did before SSO-17693: the runtime URL used to ignore this override
-  // entirely and always hand agents the (possibly public/proxied) auth base URL.
+  // Read it once so PAPERCLIP_RUNTIME_API_URL honours it too -- before
+  // SSO-17693 the runtime URL ignored this override entirely and always
+  // handed agents the (possibly public/proxied) auth base URL.
   const explicitRuntimeApiUrl = process.env.PAPERCLIP_API_URL?.trim() || null;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({
     explicitApiUrl: explicitRuntimeApiUrl,
@@ -761,6 +761,21 @@ export async function startServer(): Promise<StartedServer> {
     bindHost: runtimeListenHost,
     port: listenPort,
   });
+  // The human/browser-facing API URL -- external routine-trigger webhooks,
+  // the CLI, OAuth callbacks, the startup banner -- is a separate concern
+  // from the agent-facing runtime URL above and must keep resolving to the
+  // configured public auth base URL. Collapsing the two here would break
+  // every externally-called webhook by pointing it at loopback.
+  const publicAuthOrigin = (() => {
+    const trimmed = config.authPublicBaseUrl?.trim();
+    if (!trimmed) return null;
+    try {
+      return new URL(trimmed).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const configuredApiUrl = explicitRuntimeApiUrl || publicAuthOrigin || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
     preferredApiUrl: runtimeApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
@@ -772,7 +787,7 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
-  process.env.PAPERCLIP_API_URL = runtimeApiUrl;
+  process.env.PAPERCLIP_API_URL = configuredApiUrl;
 
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
@@ -1243,8 +1258,10 @@ export async function startServer(): Promise<StartedServer> {
               : "agent-facing runtime API origin failed a boot-time reachability probe and no fallback candidate is available",
           );
           if (fallback) {
+            // Only the agent-facing variable follows the fallback -- PAPERCLIP_API_URL
+            // stays pinned to the public/operator-configured origin (webhooks, CLI,
+            // OAuth callbacks) regardless of which candidate agents end up reaching.
             process.env.PAPERCLIP_RUNTIME_API_URL = fallback;
-            process.env.PAPERCLIP_API_URL = fallback;
           }
         })
         .catch((err) => {
@@ -1374,7 +1391,7 @@ export async function startServer(): Promise<StartedServer> {
     server,
     host: config.host,
     listenPort,
-    apiUrl: runtimeApiUrl,
+    apiUrl: configuredApiUrl,
     databaseUrl: activeDatabaseConnectionString,
   };
 }

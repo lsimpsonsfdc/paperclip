@@ -498,7 +498,7 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     );
   });
 
-  it("rewrites explicit-port auth public URLs when detect-port selects a new port", async () => {
+  it("rewrites explicit-port auth public URLs for the human-facing API URL, but keeps the agent-facing runtime URL on loopback", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -510,10 +510,12 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("http://my-host.ts.net:3110");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://my-host.ts.net:3110");
+    expect(process.env.PAPERCLIP_API_URL).toBe("http://my-host.ts.net:3110");
+    // SSO-17693: agents must never receive the public/proxied auth base URL.
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 
-  it("keeps no-port auth public URLs stable when detect-port selects a new port", async () => {
+  it("keeps no-port auth public URLs stable for the human-facing API URL, but keeps the agent-facing runtime URL on loopback", async () => {
     loadConfigMock.mockReturnValueOnce(buildTestConfig({
       port: 3100,
       authBaseUrlMode: "explicit",
@@ -525,6 +527,8 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
 
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
-    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+    expect(process.env.PAPERCLIP_API_URL).toBe("https://paperclip.example");
+    // SSO-17693: agents must never receive the public/proxied auth base URL.
+    expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("http://127.0.0.1:3110");
   });
 });
