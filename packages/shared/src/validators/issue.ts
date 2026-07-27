@@ -460,7 +460,7 @@ const createIssueBaseSchema = z.object({
     agentId: z.string().uuid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
-});
+}).strict();
 
 function requireBlockedStatusForUnblockDescriptor(
   value: { status?: string; unblockDescriptor?: unknown },
@@ -524,7 +524,7 @@ export type CreateAcceptedPlanDecomposition = z.infer<typeof createAcceptedPlanD
 export const createIssueLabelSchema = z.object({
   name: z.string().trim().min(1).max(48),
   color: z.string().regex(/^#(?:[0-9a-fA-F]{6})$/, "Color must be a 6-digit hex value"),
-});
+}).strict();
 
 export type CreateIssueLabel = z.infer<typeof createIssueLabelSchema>;
 
@@ -549,7 +549,7 @@ export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorks
 export const checkoutIssueSchema = z.object({
   agentId: z.string().uuid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
-});
+}).strict();
 
 export type CheckoutIssue = z.infer<typeof checkoutIssueSchema>;
 
@@ -646,7 +646,7 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
-});
+}).strict();
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
 
@@ -1127,7 +1127,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: suggestTasksPayloadSchema,
-  }),
+  }).strict(),
   z.object({
     kind: z.literal("ask_user_questions"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
@@ -1137,7 +1137,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: askUserQuestionsPayloadSchema,
-  }),
+  }).strict(),
   z.object({
     kind: z.literal("request_confirmation"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
@@ -1147,7 +1147,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
     payload: requestConfirmationPayloadSchema,
-  }),
+  }).strict(),
   z.object({
     kind: z.literal("request_checkbox_confirmation"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
@@ -1157,7 +1157,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: requestCheckboxConfirmationPayloadSchema,
-  }),
+  }).strict(),
   z.object({
     kind: z.literal("request_item_verdicts"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
@@ -1167,7 +1167,7 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     summary: z.string().trim().max(1000).nullable().optional(),
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
     payload: requestItemVerdictsPayloadSchema,
-  }),
+  }).strict(),
 ]);
 
 export type CreateIssueThreadInteraction = z.infer<typeof createIssueThreadInteractionSchema>;
@@ -1247,7 +1247,7 @@ export type SubmitIssueThreadInteractionVerdicts = z.infer<typeof submitIssueThr
 
 export const linkIssueApprovalSchema = z.object({
   approvalId: z.string().uuid(),
-});
+}).strict();
 
 export type LinkIssueApproval = z.infer<typeof linkIssueApprovalSchema>;
 
@@ -1267,7 +1267,7 @@ export const upsertIssueDocumentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().max(524288)),
   changeSummary: z.string().trim().max(500).nullable().optional(),
   baseRevisionId: z.string().uuid().nullable().optional(),
-});
+}).strict();
 
 export const restoreIssueDocumentRevisionSchema = z.object({});
 

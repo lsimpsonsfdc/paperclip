@@ -105,16 +105,19 @@ describe("issue validators", () => {
       createdByUserId: "spoofed-creator",
       responsibleUserId: "spoofed-responsible",
     });
-    const updated = updateIssueSchema.parse({
-      title: "Do not update attribution",
-      createdByUserId: "spoofed-creator",
-      responsibleUserId: "spoofed-responsible",
-    });
 
     expect(created.createdByUserId).toBe("spoofed-creator");
     expect(created.responsibleUserId).toBe("spoofed-responsible");
-    expect(updated).not.toHaveProperty("createdByUserId");
-    expect(updated).not.toHaveProperty("responsibleUserId");
+
+    // SSO-17725: these fields used to be silently dropped by updateIssueSchema
+    // (a caller could believe attribution was reassigned when it was a no-op).
+    // Now that the schema is strict, sending them on PATCH loudly rejects
+    // instead, since they aren't part of updateIssueSchema's accepted shape.
+    expect(updateIssueSchema.safeParse({
+      title: "Do not update attribution",
+      createdByUserId: "spoofed-creator",
+      responsibleUserId: "spoofed-responsible",
+    }).success).toBe(false);
   });
 
   it("allows false-positive recovery resolutions to atomically restore the source issue status", () => {
@@ -467,5 +470,30 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+
+  it("rejects unknown top-level fields on issue create (SSO-17725)", () => {
+    const bodyResult = createIssueSchema.safeParse({ title: "Follow up PR", body: "Line 1" });
+    expect(bodyResult.success).toBe(false);
+    expect(bodyResult.success || bodyResult.error.issues[0]).toMatchObject({
+      code: "unrecognized_keys",
+      keys: ["body"],
+    });
+
+    const parentIssueIdResult = createIssueSchema.safeParse({
+      title: "Follow up PR",
+      parentIssueId: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(parentIssueIdResult.success).toBe(false);
+    expect(parentIssueIdResult.success || parentIssueIdResult.error.issues[0]).toMatchObject({
+      code: "unrecognized_keys",
+      keys: ["parentIssueId"],
+    });
+  });
+
+  it("rejects unknown top-level fields on issue patch and child create (SSO-17725)", () => {
+    expect(updateIssueSchema.safeParse({ body: "Line 1" }).success).toBe(false);
+    expect(updateIssueSchema.safeParse({ parentIssueId: "00000000-0000-4000-8000-000000000001" }).success)
+      .toBe(false);
   });
 });

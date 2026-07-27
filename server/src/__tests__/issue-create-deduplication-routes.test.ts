@@ -211,6 +211,112 @@ describeEmbeddedPostgres("issue create deduplication routes", () => {
     });
   });
 
+  it("rejects unknown top-level create fields with 422 naming the field and suggesting the accepted key (SSO-17725)", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    const bodyRes = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Follow up PR", body: "Specification text" })
+      .expect(422);
+    expect(bodyRes.body).toMatchObject({
+      code: "unrecognized_fields",
+      details: {
+        code: "unrecognized_fields",
+        unknownFields: [{ field: "body", suggestedField: "description" }],
+      },
+    });
+
+    const parentIssueIdRes = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentIssueId: parent.id, title: "Follow up PR" })
+      .expect(422);
+    expect(parentIssueIdRes.body).toMatchObject({
+      code: "unrecognized_fields",
+      details: {
+        code: "unrecognized_fields",
+        unknownFields: [{ field: "parentIssueId", suggestedField: "parentId" }],
+      },
+    });
+
+    expect(await db.select().from(issues)).toHaveLength(1);
+  });
+
+  it("rejects unknown top-level patch fields with 422 (SSO-17725)", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    const created = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Existing issue" })
+      .expect(201);
+
+    const patchRes = await request(app)
+      .patch(`/api/issues/${created.body.id}`)
+      .send({ body: "Corrected specification" })
+      .expect(422);
+    expect(patchRes.body).toMatchObject({
+      code: "unrecognized_fields",
+      details: {
+        unknownFields: [{ field: "body", suggestedField: "description" }],
+      },
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, created.body.id));
+    expect(stored.description).toBeNull();
+  });
+
+  it("returns 409 instead of silently dropping a corrected field on same-title recreate (SSO-17725)", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    const first = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Investigate outage" })
+      .expect(201);
+
+    const recreateWithDescription = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        parentId: parent.id,
+        title: "Investigate outage",
+        description: "Corrected specification that must not be silently dropped",
+      })
+      .expect(409);
+
+    expect(recreateWithDescription.body).toMatchObject({
+      code: "duplicate_title_conflict",
+      details: {
+        existingIssueId: first.body.id,
+        conflictingFields: ["description"],
+      },
+    });
+
+    const [stored] = await db.select().from(issues).where(eq(issues.id, first.body.id));
+    expect(stored.description).toBeNull();
+  });
+
+  it("still replays silently when a same-title recreate carries no conflicting fields", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParent(companyId);
+    const app = createApp();
+
+    const first = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Investigate outage", description: "Root cause TBD" })
+      .expect(201);
+
+    const replay = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({ parentId: parent.id, title: "Investigate outage", description: "Root cause TBD" })
+      .expect(200);
+
+    expect(replay.body).toMatchObject({ id: first.body.id, deduplicated: true, deduplicationReason: "recent_open_title" });
+  });
+
   it("allows an explicit duplicate create", async () => {
     const companyId = await seedCompany();
     const parent = await seedParent(companyId);

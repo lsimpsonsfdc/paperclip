@@ -139,6 +139,22 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS = ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
+// Fields checked when a create request matches an existing issue by recent
+// open title (see `recent_open_title` dedup below). Status/workMode/priority/
+// requestDepth are deliberately excluded: they carry schema defaults, so an
+// unrelated retry that omits them would otherwise look like a false conflict.
+// None of these have schema defaults, so an unset field parses to
+// null/undefined and is skipped rather than flagged.
+const RECENT_TITLE_DUPLICATE_CONFLICT_FIELDS = [
+  "description",
+  "assigneeAgentId",
+  "assigneeUserId",
+  "projectId",
+  "goalId",
+  "billingCode",
+  "executionWorkspaceId",
+  "executionWorkspacePreference",
+] as const;
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
 
@@ -6323,6 +6339,27 @@ export function issueService(db: Db) {
             .orderBy(asc(issues.createdAt), asc(issues.id))
             .limit(1);
           if (existingIssue) deduplicationReason = "recent_open_title";
+          if (existingIssue) {
+            const incoming = issueData as Record<string, unknown>;
+            const existingRow = existingIssue as unknown as Record<string, unknown>;
+            const conflictingFields = RECENT_TITLE_DUPLICATE_CONFLICT_FIELDS.filter((field) => {
+              const incomingValue = incoming[field] ?? null;
+              if (incomingValue === null) return false;
+              return incomingValue !== (existingRow[field] ?? null);
+            });
+            if (conflictingFields.length > 0) {
+              throw conflict(
+                "A recent open issue with this title already exists with different field values. " +
+                "PATCH the existing issue directly, or pass allowDuplicate: true to create a separate issue.",
+                {
+                  code: "duplicate_title_conflict",
+                  existingIssueId: existingIssue.id,
+                  existingIssueIdentifier: existingIssue.identifier,
+                  conflictingFields,
+                },
+              );
+            }
+          }
         }
         if (existingIssue) {
           if (idempotencyKey) {
