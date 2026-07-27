@@ -610,6 +610,52 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  it("allows an agent to cancel its own pending interaction without board access", async () => {
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([{ status: "pending", createdByAgentId: CREATED_AGENT_ID }]).then(onFulfilled, onRejected),
+    }));
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      {},
+      { agentId: CREATED_AGENT_ID, userId: null },
+    );
+  });
+
+  it("still blocks an agent from cancelling an interaction it did not create", async () => {
+    mockDbSelectWhere.mockImplementation(() => ({
+      then: (onFulfilled: (rows: unknown[]) => unknown, onRejected?: (reason: unknown) => unknown) =>
+        Promise.resolve([{ status: "pending", createdByAgentId: ASSIGNEE_AGENT_ID }]).then(onFulfilled, onRejected),
+    }));
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancelQuestions).not.toHaveBeenCalled();
+  });
+
   it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {
     mockInteractionService.acceptInteraction.mockResolvedValueOnce({
       interaction: {

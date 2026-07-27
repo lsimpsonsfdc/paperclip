@@ -3713,6 +3713,26 @@ export function issueRoutes(
     return false;
   }
 
+  async function agentCreatedPendingInteraction(
+    issue: { id: string; companyId: string },
+    interactionId: string,
+    agentId: string,
+  ) {
+    const row = await db
+      .select({
+        status: issueThreadInteractions.status,
+        createdByAgentId: issueThreadInteractions.createdByAgentId,
+      })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.id, interactionId),
+        eq(issueThreadInteractions.companyId, issue.companyId),
+        eq(issueThreadInteractions.issueId, issue.id),
+      ))
+      .then((rows) => rows[0] ?? null);
+    return row !== null && row.status === "pending" && row.createdByAgentId === agentId;
+  }
+
   async function rejectAgentIssueThreadInteractionResolution(
     req: Request,
     res: Response,
@@ -9594,10 +9614,15 @@ export function issueRoutes(
       const interactionId = req.params.interactionId as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
-      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
-      assertBoard(req);
-
       const actor = getActorInfo(req);
+      const isCreatorSelfCancel = actor.actorType === "agent"
+        && actor.agentId !== null
+        && (await agentCreatedPendingInteraction(issue, interactionId, actor.agentId));
+      if (!isCreatorSelfCancel) {
+        if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
+        assertBoard(req);
+      }
+
       const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
