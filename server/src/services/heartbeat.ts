@@ -1339,7 +1339,24 @@ function deriveRepoNameFromRepoUrl(repoUrl: string | null): string | null {
   }
 }
 
-async function ensureManagedProjectWorkspace(input: {
+// Entries Paperclip itself seeds into a managed project workspace before the repo is ever
+// cloned there (e.g. design-anchor docs). Their presence must not be mistaken for "this
+// directory already holds real, unrelated content" and used to skip the managed clone.
+const MANAGED_WORKSPACE_PLATFORM_OWNED_ENTRIES = new Set([".paperclip"]);
+
+async function cloneManagedWorkspaceGitRepo(cwd: string, repoUrl: string): Promise<void> {
+  try {
+    await execFile("git", ["clone", repoUrl, cwd], {
+      env: sanitizeRuntimeServiceBaseEnv(process.env),
+      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to prepare managed checkout for "${repoUrl}" at "${cwd}": ${reason}`);
+  }
+}
+
+export async function ensureManagedProjectWorkspace(input: {
   companyId: string;
   projectId: string;
   repoUrl: string | null;
@@ -1369,25 +1386,43 @@ async function ensureManagedProjectWorkspace(input: {
 
   if (stats) {
     const entries = await fs.readdir(cwd).catch(() => []);
-    if (entries.length > 0) {
-      return {
-        cwd,
-        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
-      };
+    const nonPlatformEntries = entries.filter((entry) => !MANAGED_WORKSPACE_PLATFORM_OWNED_ENTRIES.has(entry));
+    if (nonPlatformEntries.length > 0) {
+      const warning = `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`;
+      logger.warn(
+        {
+          companyId: input.companyId,
+          projectId: input.projectId,
+          cwd,
+          entries: nonPlatformEntries,
+        },
+        "ensureManagedProjectWorkspace: existing path is not a git checkout; skipping managed clone",
+      );
+      return { cwd, warning };
     }
-    await fs.rm(cwd, { recursive: true, force: true });
+
+    // The directory is empty, or holds only platform-owned entries (e.g. a seeded .paperclip
+    // design-anchor folder). Clone into a temp dir and move those entries back in afterward,
+    // instead of gating the clone on entry count — that count-based check is what let a
+    // platform-seeded .paperclip silently block the managed clone (SSO-17711).
+    const tempCloneDir = `${cwd}.clone-${randomUUID()}`;
+    await fs.rm(tempCloneDir, { recursive: true, force: true });
+    try {
+      await cloneManagedWorkspaceGitRepo(tempCloneDir, input.repoUrl);
+      for (const entry of entries) {
+        await fs.rename(path.resolve(cwd, entry), path.resolve(tempCloneDir, entry));
+      }
+      await fs.rm(cwd, { recursive: true, force: true });
+      await fs.rename(tempCloneDir, cwd);
+    } catch (error) {
+      await fs.rm(tempCloneDir, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+    return { cwd, warning: null };
   }
 
-  try {
-    await execFile("git", ["clone", input.repoUrl, cwd], {
-      env: sanitizeRuntimeServiceBaseEnv(process.env),
-      timeout: MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS,
-    });
-    return { cwd, warning: null };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}`);
-  }
+  await cloneManagedWorkspaceGitRepo(cwd, input.repoUrl);
+  return { cwd, warning: null };
 }
 
 type WorkspaceValidationFailureLike = WorkspaceValidationFailure | {
@@ -2118,6 +2153,48 @@ export function prioritizeProjectWorkspaceCandidatesForRun<T extends ProjectWork
   const preferredIndex = rows.findIndex((row) => row.id === preferredWorkspaceId);
   if (preferredIndex <= 0) return rows;
   return [rows[preferredIndex]!, ...rows.slice(0, preferredIndex), ...rows.slice(preferredIndex + 1)];
+}
+
+export function buildProjectWorkspaceUnavailableFallback(input: {
+  resolvedProjectId: string | null;
+  fallbackCwd: string;
+  preferredWorkspaceWarning: string | null;
+  missingProjectCwds: string[];
+  hasConfiguredProjectCwd: boolean;
+  firstProjectWorkspaceRow: { id: string; repoUrl: string | null; repoRef: string | null } | null;
+  workspaceHints: ResolvedWorkspaceForRun["workspaceHints"];
+}): ResolvedWorkspaceForRun {
+  const warnings: string[] = [];
+  if (input.preferredWorkspaceWarning) {
+    warnings.push(input.preferredWorkspaceWarning);
+  }
+  if (input.missingProjectCwds.length > 0) {
+    const firstMissing = input.missingProjectCwds[0];
+    const extraMissingCount = Math.max(0, input.missingProjectCwds.length - 1);
+    warnings.push(
+      extraMissingCount > 0
+        ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`
+        : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  } else if (!input.hasConfiguredProjectCwd) {
+    warnings.push(
+      `Project workspace has no local cwd configured. Using fallback workspace "${input.fallbackCwd}" for this run.`,
+    );
+  }
+  return {
+    cwd: input.fallbackCwd,
+    // Intentionally "agent_home", not "project_primary": no configured project workspace path
+    // was reachable, so this run is falling back to the agent's ad-hoc home directory. Guards
+    // like assertGitWorktreeBaseWorkspaceReady key off this source to refuse git-sensitive work
+    // from an unintended cwd; mislabeling this as project_primary silently bypasses them.
+    source: "agent_home" as const,
+    projectId: input.resolvedProjectId,
+    workspaceId: input.firstProjectWorkspaceRow?.id ?? null,
+    repoUrl: input.firstProjectWorkspaceRow?.repoUrl ?? null,
+    repoRef: input.firstProjectWorkspaceRow?.repoRef ?? null,
+    workspaceHints: input.workspaceHints,
+    warnings,
+  };
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -7437,33 +7514,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
       await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (preferredWorkspaceWarning) {
-        warnings.push(preferredWorkspaceWarning);
-      }
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
-      return {
-        cwd: fallbackCwd,
-        source: "project_primary" as const,
-        projectId: resolvedProjectId,
-        workspaceId: projectWorkspaceRows[0]?.id ?? null,
-        repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
+      const fallbackResult = buildProjectWorkspaceUnavailableFallback({
+        resolvedProjectId,
+        fallbackCwd,
+        preferredWorkspaceWarning,
+        missingProjectCwds,
+        hasConfiguredProjectCwd,
+        firstProjectWorkspaceRow: projectWorkspaceRows[0] ?? null,
         workspaceHints,
-        warnings,
-      };
+      });
+      // Every configured project workspace candidate was unreachable (or unconfigured); this is
+      // an agent-home fallback, not a real project checkout. Reporting this as "project_primary"
+      // would bypass assertGitWorktreeBaseWorkspaceReady and let a git-sensitive adapter launch
+      // from the wrong directory silently (SSO-17707 / SSO-17711).
+      logger.warn(
+        {
+          agentId: agent.id,
+          projectId: resolvedProjectId,
+          candidateProjectCwds: missingProjectCwds,
+          fallbackCwd,
+        },
+        "resolveWorkspaceForRun: no configured project workspace path was usable; falling back to agent-home cwd",
+      );
+      return fallbackResult;
     }
 
     if (workspaceProjectId) {
@@ -14217,6 +14290,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
+        await ensureWorkspaceValidationFailureVisibleOnIssue(livenessRun, agent);
 
         await updateRuntimeState(agent, livenessRun, {
           exitCode: null,
@@ -14340,6 +14414,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 "failed to release issue execution after heartbeat setup failure",
               );
             });
+            if (failedAgent) {
+              await ensureWorkspaceValidationFailureVisibleOnIssue(livenessRun, failedAgent).catch((visibilityError) => {
+                logger.warn(
+                  { err: visibilityError, runId: livenessRun.id },
+                  "failed to post workspace-validation failure visibility comment after setup failure",
+                );
+              });
+            }
           }
           // Ensure the agent is not left stuck in "running" if the setup-failure
           // path owned the terminal transition. If another path already finalized
@@ -14443,6 +14525,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `This prevents git-sensitive adapters from running in an unrelated fallback cwd.${failureSummary ?? ""} ` +
       "Moving it to `blocked` with a source-scoped recovery action so the workspace link, cwd, or git checkout can be repaired before resuming."
     );
+  }
+
+  // releaseIssueExecutionAndPromote only posts buildWorkspaceValidationRecoveryComment when the
+  // issue is still todo/in_progress, unowned by a human, and assigned to this run's agent. Outside
+  // that narrow window (human-assigned issue, or issue already in another status) nothing else
+  // posts about the failure, and finalizeIssueCommentPolicy is deliberately skipped for these runs
+  // too (the adapter never launched, so it could never have posted a comment itself; queuing a
+  // retry wake would just hit the same validation failure again). Without this, the run fails
+  // silently on the board. This is an additive, idempotent fallback: it never changes issue status
+  // or ownership, and is a no-op if a comment for this exact run already exists.
+  async function ensureWorkspaceValidationFailureVisibleOnIssue(
+    run: typeof heartbeatRuns.$inferSelect,
+    agent: typeof agents.$inferSelect,
+  ) {
+    if (!isWorkspaceValidationFailedRun(run)) return;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return;
+    try {
+      const alreadyPosted = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, issueId), eq(issueComments.createdByRunId, run.id)))
+        .limit(1)
+        .then((rows) => rows.length > 0);
+      if (alreadyPosted) return;
+      const failureSummary = summarizeRunFailureForIssueComment(run);
+      const body =
+        "Heartbeat run failed workspace validation before the local adapter launched, so it stopped " +
+        `without producing any adapter output or comment of its own.${failureSummary ?? ""} This guard ` +
+        "exists to stop a git-sensitive adapter from running in an unrelated fallback cwd; the workspace " +
+        "link, cwd, or git checkout needs repair before the next run on this issue can proceed.";
+      await issuesSvc.addComment(issueId, body, { runId: run.id }, { authorType: "system" });
+    } catch (err) {
+      logger.warn(
+        { err, runId: run.id, agentId: agent.id, issueId },
+        "failed to post workspace-validation failure visibility comment",
+      );
+    }
   }
 
   function buildConfigurationIncompleteRecoveryComment(input: {
