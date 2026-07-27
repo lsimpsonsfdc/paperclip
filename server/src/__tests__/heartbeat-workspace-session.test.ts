@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { describe, expect, it, vi } from "vitest";
 import type { agents } from "@paperclipai/db";
 import { sessionCodec as codexSessionCodec } from "@paperclipai/adapter-codex-local/server";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   applyPersistedExecutionWorkspaceConfig,
   assertGitSensitiveAdapterWorkspaceValid,
@@ -2723,7 +2723,11 @@ describe("ensureManagedProjectWorkspace clone-into-dir-containing-only-.papercli
 
       const repoUrl = `file://${sourceRepo}`;
       const repoName = path.basename(sourceRepo);
-      const managedCwd = path.resolve(sandboxHome, "instances", "default", "projects", "company-1", "project-1", repoName);
+      const managedCwd = resolveManagedProjectWorkspaceDir({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoName,
+      });
 
       // Simulate Paperclip's own design-anchor seeding into the not-yet-cloned managed folder.
       await fs.mkdir(path.join(managedCwd, ".paperclip", "design"), { recursive: true });
@@ -2768,7 +2772,11 @@ describe("ensureManagedProjectWorkspace clone-into-dir-containing-only-.papercli
 
       const repoUrl = `file://${sourceRepo}`;
       const repoName = path.basename(sourceRepo);
-      const managedCwd = path.resolve(sandboxHome, "instances", "default", "projects", "company-1", "project-1", repoName);
+      const managedCwd = resolveManagedProjectWorkspaceDir({
+        companyId: "company-1",
+        projectId: "project-1",
+        repoName,
+      });
 
       await fs.mkdir(managedCwd, { recursive: true });
       await fs.writeFile(path.join(managedCwd, "unrelated-file.txt"), "not a git checkout\n", "utf8");
