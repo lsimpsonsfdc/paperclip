@@ -345,6 +345,37 @@ function buildStaleTargetResult(
   } as const;
 }
 
+function buildCancelledResult(row: IssueThreadInteractionRow, reason: string | null) {
+  switch (row.kind) {
+    case "ask_user_questions":
+      return {
+        version: 1,
+        answers: [],
+        cancelled: true,
+        cancellationReason: reason,
+        summaryMarkdown: null,
+      } as const;
+    case "request_confirmation":
+    case "request_checkbox_confirmation":
+      return {
+        version: 1,
+        outcome: "cancelled",
+        reason,
+      } as const;
+    case "request_item_verdicts": {
+      const interaction = hydrateInteraction(row) as RequestItemVerdictsInteraction;
+      return {
+        version: 1,
+        outcome: "cancelled",
+        complete: false,
+        items: interaction.result?.items ?? [],
+      } satisfies RequestItemVerdictsResult;
+    }
+    default:
+      throw unprocessable(`${row.kind} interactions cannot be cancelled`);
+  }
+}
+
 function resolveActorKind(interaction: Pick<IssueThreadInteraction, "resolvedByAgentId" | "resolvedByUserId">) {
   if (interaction.resolvedByAgentId) return "agent";
   if (interaction.resolvedByUserId) return "user";
@@ -1937,7 +1968,7 @@ export function issueThreadInteractionService(db: Db) {
       return answered;
     },
 
-    cancelQuestions: async (
+    cancel: async (
       issue: { id: string; companyId: string },
       interactionId: string,
       input: CancelIssueThreadInteraction,
@@ -1954,8 +1985,8 @@ export function issueThreadInteractionService(db: Db) {
       if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
         throw notFound("Interaction not found");
       }
-      if (current.kind !== "ask_user_questions") {
-        throw unprocessable("Only ask_user_questions interactions can be cancelled");
+      if (current.kind === "suggest_tasks") {
+        throw unprocessable("suggest_tasks interactions cannot be cancelled; use reject instead");
       }
       if (current.status !== "pending") {
         throw conflict("Interaction has already been resolved");
@@ -1966,13 +1997,7 @@ export function issueThreadInteractionService(db: Db) {
         .update(issueThreadInteractions)
         .set({
           status: "cancelled",
-          result: {
-            version: 1,
-            answers: [],
-            cancelled: true,
-            cancellationReason: reason,
-            summaryMarkdown: null,
-          },
+          result: buildCancelledResult(current, reason),
           resolvedByAgentId: actor.agentId ?? null,
           resolvedByUserId: actor.userId ?? null,
           resolvedAt: new Date(),

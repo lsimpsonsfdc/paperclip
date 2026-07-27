@@ -3733,6 +3733,36 @@ export function issueRoutes(
     return true;
   }
 
+  // Cancel is withdrawal, not resolution: the creator of a pending interaction may
+  // retract their own request regardless of actor type. accept/reject stay board-only
+  // via rejectAgentIssueThreadInteractionResolution below (SSO-17723).
+  async function assertInteractionCancelAllowed(
+    req: Request,
+    res: Response,
+    issue: {
+      id: string;
+      companyId: string;
+      parentId?: string | null;
+    },
+    interactionId: string,
+  ) {
+    if (req.actor.type === "agent" && req.actor.agentId) {
+      const interaction = await issueThreadInteractionService(db).getById(interactionId);
+      if (
+        interaction
+        && interaction.issueId === issue.id
+        && interaction.companyId === issue.companyId
+        && interaction.status === "pending"
+        && interaction.createdByAgentId === req.actor.agentId
+      ) {
+        return true;
+      }
+    }
+    if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return false;
+    assertBoard(req);
+    return true;
+  }
+
   async function assertTaskWatchdogCreateIssueAllowed(
     req: Request,
     res: Response,
@@ -9594,11 +9624,10 @@ export function issueRoutes(
       const interactionId = req.params.interactionId as string;
       const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
       if (!issue) return;
-      if (await rejectAgentIssueThreadInteractionResolution(req, res, issue)) return;
-      assertBoard(req);
+      if (!(await assertInteractionCancelAllowed(req, res, issue, interactionId))) return;
 
       const actor = getActorInfo(req);
-      const interaction = await issueThreadInteractionService(db).cancelQuestions(issue, interactionId, req.body, {
+      const interaction = await issueThreadInteractionService(db).cancel(issue, interactionId, req.body, {
         agentId: actor.agentId,
         userId: actor.actorType === "user" ? actor.actorId : null,
       });
@@ -9617,9 +9646,13 @@ export function issueRoutes(
           interactionId: interaction.id,
           interactionKind: interaction.kind,
           interactionStatus: interaction.status,
+          cancelledByAgentId: actor.actorType === "agent" ? actor.agentId : null,
+          cancelledByCreatorSelfCancel: actor.actorType === "agent" && actor.agentId === interaction.createdByAgentId,
           cancellationReason:
             interaction.kind === "ask_user_questions"
               ? (interaction.result?.cancellationReason ?? null)
+              : interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation"
+              ? (interaction.result?.reason ?? null)
               : null,
         },
       });

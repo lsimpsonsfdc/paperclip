@@ -11,6 +11,7 @@ const mockIssueService = vi.hoisted(() => ({
 
 const mockInteractionService = vi.hoisted(() => ({
   listForIssue: vi.fn(),
+  getById: vi.fn(),
   create: vi.fn(),
   acceptInteraction: vi.fn(),
   acceptSuggestedTasks: vi.fn(),
@@ -19,7 +20,7 @@ const mockInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
-  cancelQuestions: vi.fn(),
+  cancel: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -327,7 +328,7 @@ describe.sequential("issue thread interaction routes", () => {
       },
       newlyResolvedItemIds: ["docs"],
     });
-    mockInteractionService.cancelQuestions.mockResolvedValue({
+    mockInteractionService.cancel.mockResolvedValue({
       id: "interaction-2",
       companyId: "company-1",
       issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -337,6 +338,8 @@ describe.sequential("issue thread interaction routes", () => {
       idempotencyKey: null,
       sourceCommentId: "comment-2",
       sourceRunId: "run-2",
+      createdByAgentId: null,
+      createdByUserId: "local-board",
       payload: {
         version: 1,
         questions: [{
@@ -583,7 +586,7 @@ describe.sequential("issue thread interaction routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.status).toBe("cancelled");
-    expect(mockInteractionService.cancelQuestions).toHaveBeenCalledWith(
+    expect(mockInteractionService.cancel).toHaveBeenCalledWith(
       expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
       "interaction-2",
       {},
@@ -608,6 +611,94 @@ describe.sequential("issue thread interaction routes", () => {
         action: "issue.thread_interaction_cancelled",
       }),
     );
+  });
+
+  it("allows the creating agent to cancel its own pending interaction without board access", async () => {
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      createdByAgentId: CREATED_AGENT_ID,
+      createdByUserId: null,
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.cancel).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      {},
+      { agentId: CREATED_AGENT_ID, userId: null },
+    );
+  });
+
+  it("still returns 403 when a different agent cancels an interaction it did not create", async () => {
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "pending",
+      createdByAgentId: ASSIGNEE_AGENT_ID,
+      createdByUserId: null,
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancel).not.toHaveBeenCalled();
+  });
+
+  it("still returns 403 when an agent tries to accept an interaction (board-only, unchanged)", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-1/accept")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+  });
+
+  it("still returns 403 when an agent tries to reject an interaction (board-only, unchanged)", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: null,
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-1/reject")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
   });
 
   it("accepts request confirmations and wakes the current assignee when configured for accept-only wakeups", async () => {

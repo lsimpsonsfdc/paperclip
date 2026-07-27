@@ -547,7 +547,7 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
       userId: "local-board",
     });
 
-    const cancelled = await interactionsSvc.cancelQuestions({
+    const cancelled = await interactionsSvc.cancel({
       id: issueId,
       companyId,
     }, created.id, {
@@ -573,6 +573,86 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     }, {
       userId: "local-board",
     })).rejects.toThrow("Interaction has already been resolved");
+  });
+
+  it("cancels a pending request_confirmation interaction regardless of kind", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Cancel a pending confirmation");
+    const creatorAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: creatorAgentId,
+      companyId,
+      name: "CreatorAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        prompt: "Apply this plan?",
+      },
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    const cancelled = await interactionsSvc.cancel({
+      id: issueId,
+      companyId,
+    }, created.id, {
+      reason: "Superseded by a follow-up request",
+    }, {
+      agentId: creatorAgentId,
+    });
+
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.result).toEqual({
+      version: 1,
+      outcome: "cancelled",
+      reason: "Superseded by a follow-up request",
+    });
+
+    await expect(interactionsSvc.acceptInteraction({
+      id: issueId,
+      companyId,
+      goalId: null,
+      projectId: null,
+    }, created.id, {}, {
+      userId: "local-board",
+    })).rejects.toThrow("Interaction has already been resolved");
+  });
+
+  it("refuses to cancel suggest_tasks interactions", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Cancel refused for suggest_tasks");
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      continuationPolicy: "wake_assignee",
+      payload: {
+        version: 1,
+        tasks: [{ clientKey: "task-1", title: "One" }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    await expect(interactionsSvc.cancel({
+      id: issueId,
+      companyId,
+    }, created.id, {}, {
+      userId: "local-board",
+    })).rejects.toThrow("suggest_tasks interactions cannot be cancelled");
   });
 
   it("expires ask_user_questions interactions by default when a user comments after creation", async () => {
