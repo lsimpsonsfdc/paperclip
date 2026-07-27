@@ -73,4 +73,21 @@ describe("buildPaperclipEnv", () => {
 
     expect(env.PAPERCLIP_API_URL).toBe("http://[::1]:3101");
   });
+
+  // Regression guard for SSO-17693. buildPaperclipEnv() itself just trusts
+  // whatever index.ts resolved into PAPERCLIP_RUNTIME_API_URL — it has no way
+  // to tell a loopback origin from a public/proxied one. The actual fix lives
+  // in choosePrimaryRuntimeApiUrl() (see runtime-api.test.ts); this test
+  // documents that once that origin is correct, it propagates to agents
+  // unchanged, so a regression in either layer alone would surface here or there.
+  it("propagates whatever PAPERCLIP_RUNTIME_API_URL the boot-time origin selection resolved to", () => {
+    process.env.PAPERCLIP_RUNTIME_API_URL = "http://127.0.0.1:3100";
+    delete process.env.PAPERCLIP_API_URL;
+    process.env.PAPERCLIP_LISTEN_HOST = "0.0.0.0";
+    process.env.PAPERCLIP_LISTEN_PORT = "3100";
+
+    const env = buildPaperclipEnv({ id: "agent-1", companyId: "company-1" });
+
+    expect(env.PAPERCLIP_API_URL).toBe("http://127.0.0.1:3100");
+  });
 });

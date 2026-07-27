@@ -63,7 +63,7 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, probeRuntimeApiReachability } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
@@ -750,15 +750,19 @@ export async function startServer(): Promise<StartedServer> {
   }
   
   const runtimeListenHost = config.host;
+  // An operator-set PAPERCLIP_API_URL always wins (see choosePrimaryRuntimeApiUrl).
+  // Read it once so PAPERCLIP_RUNTIME_API_URL and PAPERCLIP_API_URL cannot diverge
+  // the way they did before SSO-17693: the runtime URL used to ignore this override
+  // entirely and always hand agents the (possibly public/proxied) auth base URL.
+  const explicitRuntimeApiUrl = process.env.PAPERCLIP_API_URL?.trim() || null;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({
-    authPublicBaseUrl: config.authPublicBaseUrl ?? null,
+    explicitApiUrl: explicitRuntimeApiUrl,
     allowedHostnames: config.allowedHostnames,
     bindHost: runtimeListenHost,
     port: listenPort,
   });
-  const configuredApiUrl = process.env.PAPERCLIP_API_URL?.trim() || runtimeApiUrl;
   const runtimeApiCandidates = buildRuntimeApiCandidateUrls({
-    preferredApiUrl: configuredApiUrl,
+    preferredApiUrl: runtimeApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
     allowedHostnames: config.allowedHostnames,
     bindHost: runtimeListenHost,
@@ -768,8 +772,8 @@ export async function startServer(): Promise<StartedServer> {
   process.env.PAPERCLIP_LISTEN_PORT = String(listenPort);
   process.env.PAPERCLIP_RUNTIME_API_URL = runtimeApiUrl;
   process.env.PAPERCLIP_RUNTIME_API_CANDIDATES_JSON = JSON.stringify(runtimeApiCandidates);
-  process.env.PAPERCLIP_API_URL = configuredApiUrl;
-  
+  process.env.PAPERCLIP_API_URL = runtimeApiUrl;
+
   setupEnvironmentCustomImageTerminalWebSocketServer(server, db as any, {
     pluginWorkerManager,
   });
@@ -1215,6 +1219,38 @@ export async function startServer(): Promise<StartedServer> {
     server.listen(listenPort, config.host, () => {
       server.off("error", onError);
       logger.info(`Server listening on ${config.host}:${listenPort}`);
+
+      // Boot-time reachability check for the agent-facing runtime API origin
+      // (SSO-17693). Runs after listen() so the server can actually answer;
+      // fire-and-forget so a slow/failed probe never delays startup. Never
+      // logs the bearer token — only the candidate URLs.
+      void probeRuntimeApiReachability(runtimeApiUrl)
+        .then((reachable) => {
+          if (reachable) return;
+          if (explicitRuntimeApiUrl) {
+            logger.warn(
+              { runtimeApiUrl },
+              "operator-configured PAPERCLIP_API_URL failed a boot-time reachability probe from the server process; " +
+                "agents will still use it because an explicit override always wins",
+            );
+            return;
+          }
+          const fallback = runtimeApiCandidates.find((candidate) => candidate !== runtimeApiUrl) ?? null;
+          logger.warn(
+            { preferredRuntimeApiUrl: runtimeApiUrl, fallbackRuntimeApiUrl: fallback },
+            fallback
+              ? "agent-facing runtime API origin failed a boot-time reachability probe; falling back for subsequently spawned agents"
+              : "agent-facing runtime API origin failed a boot-time reachability probe and no fallback candidate is available",
+          );
+          if (fallback) {
+            process.env.PAPERCLIP_RUNTIME_API_URL = fallback;
+            process.env.PAPERCLIP_API_URL = fallback;
+          }
+        })
+        .catch((err) => {
+          logger.warn({ err }, "failed to run boot-time reachability probe for the agent-facing runtime API origin");
+        });
+
       if (process.env.PAPERCLIP_OPEN_ON_LISTEN === "true") {
         const openHost = config.host === "0.0.0.0" || config.host === "::" ? "127.0.0.1" : config.host;
         const url = `http://${openHost}:${listenPort}`;
@@ -1338,7 +1374,7 @@ export async function startServer(): Promise<StartedServer> {
     server,
     host: config.host,
     listenPort,
-    apiUrl: configuredApiUrl,
+    apiUrl: runtimeApiUrl,
     databaseUrl: activeDatabaseConnectionString,
   };
 }

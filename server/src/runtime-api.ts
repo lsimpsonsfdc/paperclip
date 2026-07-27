@@ -1,3 +1,5 @@
+import http from "node:http";
+import https from "node:https";
 import os from "node:os";
 
 function normalizeHost(value: string | null | undefined): string {
@@ -47,25 +49,36 @@ function pushCandidate(
 }
 
 export function choosePrimaryRuntimeApiUrl(input: {
-  authPublicBaseUrl?: string | null;
+  // Operator-set PAPERCLIP_API_URL. A deliberate override always wins, even
+  // over a locally-reachable origin, so deployments that front the API
+  // differently (e.g. a sidecar proxy) keep control.
+  explicitApiUrl?: string | null;
   allowedHostnames: string[];
   bindHost: string;
   port: number;
 }): string {
-  const explicitPublicBaseUrl = input.authPublicBaseUrl?.trim();
-  if (explicitPublicBaseUrl) {
+  const explicitOverride = input.explicitApiUrl?.trim();
+  if (explicitOverride) {
     try {
-      return new URL(explicitPublicBaseUrl).origin;
+      return new URL(explicitOverride).origin;
     } catch {
-      // Fall through to derived candidates if config parsing drifted.
+      // Fall through to derived candidates if the override is malformed.
     }
   }
 
+  // This becomes PAPERCLIP_RUNTIME_API_URL, the origin agents use to send
+  // their bearer run token. It must be reachable from inside this process's
+  // own host/network namespace, so an auth-flow public base URL (meant for
+  // browsers and OAuth callbacks, which may sit behind a reverse proxy or
+  // auth gateway) is never eligible here — see SSO-17693.
   const bindHost = normalizeHost(input.bindHost);
-  if (bindHost && !isWildcardHost(bindHost) && isLoopbackHost(bindHost)) {
-    return formatOrigin("http:", bindHost, input.port);
+  if (!bindHost || isWildcardHost(bindHost) || isLoopbackHost(bindHost)) {
+    return formatOrigin("http:", "127.0.0.1", input.port);
   }
 
+  // Bound to one specific non-loopback interface: loopback may not accept
+  // connections in that configuration, so prefer a declared reachable
+  // hostname over the raw bind host.
   const allowedHostname = input.allowedHostnames
     .map((value) => value.trim())
     .find(Boolean);
@@ -73,11 +86,45 @@ export function choosePrimaryRuntimeApiUrl(input: {
     return formatOrigin("http:", allowedHostname, input.port);
   }
 
-  if (bindHost && !isWildcardHost(bindHost)) {
-    return formatOrigin("http:", bindHost, input.port);
-  }
+  return formatOrigin("http:", bindHost, input.port);
+}
 
-  return formatOrigin("http:", "localhost", input.port);
+/**
+ * Boot-time reachability check for the chosen agent-facing runtime API
+ * origin. Does not send any credentials — callers should log the result
+ * (URL only, never a token) and fall back to another candidate on failure.
+ */
+export function probeRuntimeApiReachability(
+  url: string,
+  options: { timeoutMs?: number; path?: string } = {},
+): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? 1500;
+  const path = options.path ?? "/health";
+
+  return new Promise((resolve) => {
+    let target: URL;
+    try {
+      target = new URL(path, url);
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const client = target.protocol === "https:" ? https : http;
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+
+    const req = client.get(target, { timeout: timeoutMs }, (res) => {
+      res.resume();
+      finish(typeof res.statusCode === "number" && res.statusCode < 500);
+    });
+    req.on("timeout", () => req.destroy());
+    req.on("error", () => finish(false));
+  });
 }
 
 export function collectReachableInterfaceHosts(input: {
@@ -159,7 +206,6 @@ export function buildRuntimeApiCandidateUrls(input: {
       candidates,
       seen,
       choosePrimaryRuntimeApiUrl({
-        authPublicBaseUrl: input.authPublicBaseUrl,
         allowedHostnames: input.allowedHostnames,
         bindHost: input.bindHost,
         port: input.port,

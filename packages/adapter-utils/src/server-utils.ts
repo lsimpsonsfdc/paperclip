@@ -2184,7 +2184,13 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
     // for this run. PAPERCLIP_API_KEY is never accepted from config — the
     // harness-minted run token is the only source. This keeps runtime
     // identity, wake, and workspace vars authoritative regardless of what a
-    // config binding sets.
+    // config binding sets. This is intentional (not a gap) for
+    // PAPERCLIP_API_URL specifically: it's the origin the bearer run token is
+    // sent to (buildPaperclipEnv() always sets it, so `key in input.env` is
+    // always true here), and honouring a per-agent override would let a
+    // misconfigured or compromised adapterConfig redirect that token
+    // elsewhere. To change where agents point, set PAPERCLIP_API_URL on the
+    // server process instead — see choosePrimaryRuntimeApiUrl() (SSO-17693).
     if (isForbiddenConfigEnvKey(key)) continue;
     if (isPaperclipRuntimeEnvKey(key) && key in input.env) continue;
     input.env[key] = value;
