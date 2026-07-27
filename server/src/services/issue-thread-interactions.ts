@@ -15,11 +15,15 @@ import type {
   AcceptIssueThreadInteraction,
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
+  AskUserQuestionsResult,
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionRetirement,
+  IssueThreadInteractionRetirementKind,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
+  RequestConfirmationResult,
   RequestConfirmationTarget,
   RequestItemVerdictsInteraction,
   RequestItemVerdictsResult,
@@ -27,8 +31,10 @@ import type {
   RejectIssueThreadInteraction,
   RespondIssueThreadInteraction,
   SuggestTasksInteraction,
+  SuggestTasksResult,
   SuggestTasksResultCreatedTask,
   SubmitIssueThreadInteractionVerdicts,
+  WithdrawIssueThreadInteraction,
 } from "@paperclipai/shared";
 import {
   acceptIssueThreadInteractionSchema,
@@ -37,6 +43,7 @@ import {
   cancelIssueThreadInteractionSchema,
   createIssueThreadInteractionSchema,
   rejectIssueThreadInteractionSchema,
+  withdrawIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
   requestConfirmationPayloadSchema,
@@ -48,7 +55,7 @@ import {
   submitIssueThreadInteractionVerdictsSchema,
 } from "@paperclipai/shared";
 import { z } from "zod";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
@@ -323,6 +330,65 @@ function buildSupersededByCommentResult(row: IssueThreadInteractionRow, commentI
   } as const;
 }
 
+/**
+ * Build the per-kind `result` blob for an interaction retired without an
+ * operator decision. Each kind requires different result fields, so the shared
+ * `retirement` record is the one thing every kind carries — consumers should
+ * key off `result.retirement`, never off `outcome` alone.
+ */
+function buildRetiredResult(
+  row: IssueThreadInteractionRow,
+  retirement: IssueThreadInteractionRetirement,
+) {
+  if (row.kind === "suggest_tasks") {
+    return { version: 1, retirement } satisfies SuggestTasksResult;
+  }
+
+  if (row.kind === "ask_user_questions") {
+    return {
+      version: 1,
+      answers: [],
+      summaryMarkdown: null,
+      retirement,
+    } satisfies AskUserQuestionsResult;
+  }
+
+  if (row.kind === "request_item_verdicts") {
+    const interaction = hydrateInteraction(row) as RequestItemVerdictsInteraction;
+    return {
+      version: 1,
+      outcome: "retired",
+      complete: false,
+      // Preserve verdicts the operator already recorded; retiring the ask must
+      // not destroy partial work.
+      items: interaction.result?.items ?? [],
+      retirement,
+    } satisfies RequestItemVerdictsResult;
+  }
+
+  return {
+    version: 1,
+    outcome: "retired",
+    reason: retirement.reason,
+    retirement,
+  } satisfies RequestConfirmationResult;
+}
+
+function buildRetirement(args: {
+  kind: IssueThreadInteractionRetirementKind;
+  reason: string;
+  retiredByAgentId?: string | null;
+  now: Date;
+}): IssueThreadInteractionRetirement {
+  return {
+    version: 1,
+    kind: args.kind,
+    reason: args.reason,
+    retiredAt: args.now.toISOString(),
+    retiredByAgentId: args.retiredByAgentId ?? null,
+  };
+}
+
 function buildStaleTargetResult(
   row: IssueThreadInteractionRow,
   staleTarget: RequestConfirmationTarget | null,
@@ -376,7 +442,13 @@ function deriveResolutionReason(interaction: IssueThreadInteraction) {
       return "rejected";
     case "cancelled":
       return "cancelled";
+    case "withdrawn":
+      return "withdrawn_by_creator";
     case "expired": {
+      // A retired-on-close expiry is reported by its retirement kind rather
+      // than the generic per-kind outcome, so the two expiry causes stay
+      // distinguishable in telemetry.
+      if (interaction.result?.retirement) return interaction.result.retirement.kind;
       if (interaction.kind === "ask_user_questions") {
         return interaction.result?.expirationReason ?? "expired";
       }
@@ -1992,6 +2064,252 @@ export function issueThreadInteractionService(db: Db) {
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;
+    },
+
+    /**
+     * Retract a pending interaction on behalf of the actor that created it.
+     *
+     * This is deliberately NOT a resolve: the operator never decided, so the
+     * row lands in `withdrawn` rather than `cancelled`/`accepted`/`rejected`.
+     * Authorship is enforced here rather than at the route so every caller
+     * (route, CLI, future plugin bridge) inherits the same fence: an agent may
+     * only withdraw an interaction whose `createdByAgentId` is itself.
+     */
+    withdrawInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: WithdrawIssueThreadInteraction,
+      actor: InteractionActor,
+    ) => {
+      const data = withdrawIssueThreadInteractionSchema.parse(input);
+      const current = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!current) throw notFound("Interaction not found");
+      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
+        throw notFound("Interaction not found");
+      }
+
+      // Least Privilege: an agent gets exactly one new capability — retracting
+      // its OWN ask. Peer agents and unattributed agent actors stay fenced out,
+      // and accept/reject remain board-only on their existing routes.
+      if (actor.agentId) {
+        if (current.createdByAgentId !== actor.agentId) {
+          throw forbidden(
+            "Agents can only withdraw issue-thread interactions they created",
+            {
+              interactionId,
+              securityPrinciples: ["Least Privilege", "Complete Mediation", "Fail Securely"],
+            },
+          );
+        }
+      } else if (!actor.userId) {
+        throw forbidden("Withdrawing an interaction requires an authenticated actor");
+      }
+
+      if (current.status !== "pending") {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      const now = new Date();
+      const retirement = buildRetirement({
+        kind: "withdrawn_by_creator",
+        reason: data.reason,
+        retiredByAgentId: actor.agentId ?? null,
+        now,
+      });
+
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "withdrawn",
+          result: buildRetiredResult(current, retirement),
+          resolvedByAgentId: actor.agentId ?? null,
+          resolvedByUserId: actor.userId ?? null,
+          resolvedAt: now,
+          updatedAt: now,
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .returning();
+
+      if (!updated) {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      await touchIssue(db, issue.id);
+      const withdrawn = hydrateInteraction(updated);
+      await emitInteractionResolvedTelemetry(db, withdrawn);
+      return withdrawn;
+    },
+
+    /**
+     * Auto-retire every pending interaction on an issue that has reached a
+     * terminal status. The ask is moot once nobody is working the issue, and
+     * leaving it pending is what turns the operator's decision inbox into a
+     * ratchet.
+     *
+     * Lands in `expired` (not `withdrawn`): this is a system retirement, not an
+     * author retracting a specific ask. `result.retirement.kind` distinguishes
+     * it from the superseded-by-comment expiry.
+     */
+    retirePendingForClosedIssue: async (
+      issue: { id: string; companyId: string; status: string },
+      opts?: { reason?: string },
+    ) => {
+      if (!isTerminalIssueStatus(issue.status)) return [];
+
+      const rows = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(and(
+          eq(issueThreadInteractions.companyId, issue.companyId),
+          eq(issueThreadInteractions.issueId, issue.id),
+          eq(issueThreadInteractions.status, "pending"),
+        ));
+      if (rows.length === 0) return [];
+
+      const now = new Date();
+      const reason = opts?.reason
+        ?? `Issue reached terminal status "${issue.status}"; the decision is no longer needed.`;
+      const retirement = buildRetirement({ kind: "issue_closed", reason, now });
+
+      const retired: IssueThreadInteraction[] = [];
+      // Row-by-row because the result blob is kind-specific (and item-verdicts
+      // rows must each preserve their own partial verdicts). The
+      // `status = 'pending'` predicate is the concurrency guard: a decision
+      // landing in parallel wins and the row is skipped.
+      for (const row of rows) {
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: buildRetiredResult(row, retirement),
+            resolvedByAgentId: null,
+            resolvedByUserId: null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) retired.push(hydrateInteraction(updated));
+      }
+
+      if (retired.length > 0) {
+        await touchIssue(db, issue.id);
+        await emitResolvedInteractionsTelemetry(db, retired);
+      }
+      return retired;
+    },
+
+    /**
+     * Board-only bulk retirement, so clearing an accumulated backlog is one
+     * call instead of N operator clicks.
+     *
+     * `scope.mode === "closed_issues"` finds every pending interaction whose
+     * parent issue is already terminal. `scope.mode === "explicit"` takes a
+     * caller-supplied list of (issueId, interactionId) pairs. Both honour
+     * `dryRun`, which reports the exact set that would change without writing —
+     * the safe first step before a destructive bulk pass.
+     */
+    retireInteractionsBulk: async (
+      /** `null` sweeps every company — reserved for the server's own maintenance sweep. */
+      companyId: string | null,
+      scope:
+        | { mode: "closed_issues" }
+        | { mode: "explicit"; targets: ReadonlyArray<{ issueId: string; interactionId: string }> },
+      opts: { reason?: string; dryRun?: boolean; limit?: number } = {},
+    ) => {
+      const limit = opts.limit ?? 1000;
+      const companyCondition = companyId
+        ? [eq(issueThreadInteractions.companyId, companyId)]
+        : [];
+      const candidateConditions = scope.mode === "explicit"
+        ? and(
+          ...companyCondition,
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issueThreadInteractions.id, scope.targets.map((target) => target.interactionId)),
+        )
+        : and(
+          ...companyCondition,
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issues.status, ["done", "cancelled"]),
+        );
+
+      const candidateRows = await db
+        .select({ interaction: issueThreadInteractions, issueStatus: issues.status })
+        .from(issueThreadInteractions)
+        .innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
+        .where(candidateConditions)
+        .limit(limit);
+
+      // For explicit targets the caller also names the issue; drop any pair
+      // whose interaction does not actually live on the issue it claims, so a
+      // stale or mistyped list can never retire an unrelated interaction.
+      const candidates = scope.mode === "explicit"
+        ? candidateRows.filter((row) => scope.targets.some((target) =>
+          target.interactionId === row.interaction.id && target.issueId === row.interaction.issueId
+        ))
+        : candidateRows;
+
+      const matched = candidates.map((row) => ({
+        issueId: row.interaction.issueId,
+        interactionId: row.interaction.id,
+        kind: row.interaction.kind,
+        issueStatus: row.issueStatus,
+      }));
+
+      if (opts.dryRun) {
+        return { dryRun: true as const, matchedCount: matched.length, retiredCount: 0, matched };
+      }
+
+      const now = new Date();
+      const retired: IssueThreadInteraction[] = [];
+      const touchedIssueIds = new Set<string>();
+      for (const row of candidates) {
+        const reason = opts.reason
+          ?? (scope.mode === "closed_issues"
+            ? `Issue reached terminal status "${row.issueStatus}"; the decision is no longer needed.`
+            : "Retired by the board in a bulk decision-backlog cleanup.");
+        const retirement = buildRetirement({ kind: "issue_closed", reason, now });
+        const [updated] = await db
+          .update(issueThreadInteractions)
+          .set({
+            status: "expired",
+            result: buildRetiredResult(row.interaction, retirement),
+            resolvedByAgentId: null,
+            resolvedByUserId: null,
+            resolvedAt: now,
+            updatedAt: now,
+          })
+          .where(and(
+            eq(issueThreadInteractions.id, row.interaction.id),
+            eq(issueThreadInteractions.status, "pending"),
+          ))
+          .returning();
+        if (updated) {
+          retired.push(hydrateInteraction(updated));
+          touchedIssueIds.add(updated.issueId);
+        }
+      }
+
+      for (const issueId of touchedIssueIds) await touchIssue(db, issueId);
+      if (retired.length > 0) await emitResolvedInteractionsTelemetry(db, retired);
+
+      return {
+        dryRun: false as const,
+        matchedCount: matched.length,
+        retiredCount: retired.length,
+        matched,
+      };
     },
   };
 }

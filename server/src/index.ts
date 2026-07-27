@@ -47,6 +47,7 @@ import {
   environmentCustomImageService,
   heartbeatService,
   issueService,
+  issueThreadInteractionService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCloudUpstreamRunsOnStartup,
@@ -888,6 +889,7 @@ export async function startServer(): Promise<StartedServer> {
     const routines = routineService(db as any, { pluginWorkerManager });
     const statusCards = statusCardService(db as any);
     const issues = issueService(db as any);
+    const interactions = issueThreadInteractionService(db as any);
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1093,6 +1095,22 @@ export async function startServer(): Promise<StartedServer> {
           })
           .catch((err) => {
             logger.error({ err }, "environment customImage setup cleanup failed");
+          }));
+
+        // Retire pending interactions left on already-closed issues. The
+        // route-level hook covers the normal close paths; this sweep is the
+        // backstop for the ones that write issue status directly (pipelines,
+        // company teardown, watchdogs) and for rows closed before this shipped.
+        if (heartbeatSchedulerStopped) return;
+        trackHeartbeatSchedulerWork(interactions
+          .retireInteractionsBulk(null, { mode: "closed_issues" }, { limit: 500 })
+          .then((result) => {
+            if (result.retiredCount > 0) {
+              logger.info({ ...result, matched: undefined }, "retired pending interactions on closed issues");
+            }
+          })
+          .catch((err) => {
+            logger.error({ err }, "closed-issue interaction retirement sweep failed");
           }));
 
         if (heartbeatSchedulerStopped) return;

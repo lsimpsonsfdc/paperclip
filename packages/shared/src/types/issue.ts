@@ -994,11 +994,26 @@ export interface SuggestTasksResultCreatedTask {
   parentIdentifier?: string | null;
 }
 
+export type IssueThreadInteractionRetirementKind = "withdrawn_by_creator" | "issue_closed";
+
+/**
+ * Recorded on the `result` of any interaction retired without an operator
+ * decision, so a withdrawal can never be read back as an accept/reject.
+ */
+export interface IssueThreadInteractionRetirement {
+  version: 1;
+  kind: IssueThreadInteractionRetirementKind;
+  reason: string;
+  retiredAt: string;
+  retiredByAgentId?: string | null;
+}
+
 export interface SuggestTasksResult {
   version: 1;
   createdTasks?: SuggestTasksResultCreatedTask[];
   skippedClientKeys?: string[];
   rejectionReason?: string | null;
+  retirement?: IssueThreadInteractionRetirement;
 }
 
 export interface AskUserQuestionsQuestionOption {
@@ -1038,6 +1053,7 @@ export interface AskUserQuestionsResult {
   expirationReason?: "superseded_by_comment";
   commentId?: string | null;
   summaryMarkdown?: string | null;
+  retirement?: IssueThreadInteractionRetirement;
 }
 
 export interface RequestConfirmationIssueDocumentTarget {
@@ -1166,7 +1182,7 @@ export interface RequestItemVerdictsPayload {
 
 export interface RequestConfirmationResult {
   version: 1;
-  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target";
+  outcome: "accepted" | "rejected" | "superseded_by_comment" | "stale_target" | "retired";
   reason?: string | null;
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
@@ -1181,6 +1197,7 @@ export interface RequestConfirmationResult {
     updatedAt?: string | null;
   } | null;
   toolAction?: RequestConfirmationToolActionResult;
+  retirement?: IssueThreadInteractionRetirement;
 }
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {
@@ -1198,11 +1215,12 @@ export interface RequestItemVerdictsResultItem {
 
 export interface RequestItemVerdictsResult {
   version: 1;
-  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled";
+  outcome: "resolved" | "superseded_by_comment" | "stale_target" | "cancelled" | "retired";
   complete: boolean;
   items: RequestItemVerdictsResultItem[];
   commentId?: string | null;
   staleTarget?: RequestConfirmationTarget | null;
+  retirement?: IssueThreadInteractionRetirement;
 }
 
 export interface IssueThreadInteractionBase extends IssueThreadInteractionActorFields {

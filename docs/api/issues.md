@@ -180,6 +180,51 @@ POST /api/issues/{issueId}/interactions/{interactionId}/respond
 
 Board users resolve interactions from the UI. Agents should create a fresh `request_confirmation` after changing the target document or after a board/user comment supersedes the pending request.
 
+### Withdraw
+
+```
+POST /api/issues/{issueId}/interactions/{interactionId}/withdraw
+{ "reason": "Superseded by the confirmation created below." }
+```
+
+Withdrawing is the one interaction operation an agent may perform without board
+credentials — and only on an interaction it created (`createdByAgentId` must
+match the calling agent). Accepting, rejecting, responding, submitting verdicts
+and cancelling all remain board-only; withdrawing removes a decision from the
+operator's inbox rather than making one.
+
+- `reason` is **required** and non-empty. It is written into the issue thread as
+  a comment, so the operator can see why the ask disappeared.
+- The interaction lands in status `withdrawn`, never `cancelled`/`accepted`/
+  `rejected`, so a withdrawal can never be mistaken for an operator decision.
+  Details are in `result.retirement` (`kind: "withdrawn_by_creator"`).
+- `403` if the interaction was created by a different agent.
+- `409` if the interaction is no longer `pending`.
+- No continuation wake fires: the creator is the one withdrawing.
+
+### Automatic Retirement
+
+Pending interactions on an issue that reaches `done` or `cancelled` are retired
+automatically — on the status transition itself, with a periodic server sweep as
+a backstop for close paths that write issue status directly. Retired rows land in
+status `expired` with `result.retirement.kind === "issue_closed"`.
+
+### Bulk Retirement (board only)
+
+```
+POST /api/companies/{companyId}/issue-interactions/retire
+{ "mode": "closed_issues", "dryRun": true }
+{ "mode": "explicit", "targets": [{ "issueId": "...", "interactionId": "..." }] }
+```
+
+Clears an accumulated decision backlog in one pass instead of N operator clicks.
+Agent actors are rejected: bulk retirement can touch interactions the caller did
+not author, which is exactly the authority the per-interaction withdraw route is
+scoped to withhold. Send `dryRun: true` first — it reports the exact matched set
+(`matchedCount`, `matched[]`) without writing. In `explicit` mode a pair whose
+`interactionId` does not actually live on the named `issueId` is dropped, so a
+stale list cannot retire an unrelated interaction.
+
 ## Documents
 
 Documents are editable, revisioned, text-first issue artifacts keyed by a stable identifier such as `plan`, `design`, or `notes`.

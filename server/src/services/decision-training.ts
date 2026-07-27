@@ -95,7 +95,13 @@ async function loadSourceDecision(db: Db, input: CaptureInput, capturedAt: Date)
       ),
     });
     if (!row) throw notFound("Decision interaction not found");
-    const resolved = row.resolvedAt != null && row.status !== "pending";
+    // A retired interaction (withdrawn by its creator, or auto-retired when the
+    // issue closed) records that the ask went away, not what the operator would
+    // have decided. Treating it as resolved would feed a non-decision into
+    // training data as though it were an outcome label.
+    const retired = row.status === "withdrawn"
+      || (row.result as { retirement?: unknown } | null)?.retirement != null;
+    const resolved = row.resolvedAt != null && row.status !== "pending" && !retired;
     return {
       cutoffAt: resolved ? row.resolvedAt! : capturedAt,
       outcome: resolved ? row.status : null,

@@ -102,6 +102,8 @@ function statusLabel(status: IssueThreadInteraction["status"]) {
       return "Answered";
     case "cancelled":
       return "Cancelled";
+    case "withdrawn":
+      return "Withdrawn";
     case "expired":
       return "Expired";
     case "failed":
@@ -137,6 +139,9 @@ function statusIcon(status: IssueThreadInteraction["status"]) {
     case "cancelled":
     case "failed":
       return XCircle;
+    // Withdrawn and expired are both "no decision was made" — they share the
+    // muted treatment so neither reads as an operator verdict.
+    case "withdrawn":
     case "expired":
       return AlertTriangle;
     default:
@@ -159,6 +164,7 @@ function statusClasses(status: IssueThreadInteraction["status"]) {
         badge: "border-rose-500/60 bg-rose-500/10 text-rose-900 dark:bg-rose-500/15 dark:text-rose-100",
       };
     case "failed":
+    case "withdrawn":
     case "expired":
       return {
         shell: "border-amber-400/70 bg-transparent",
@@ -218,6 +224,13 @@ function planStatusClasses(
         label: "Changes requested",
         Icon: XCircle,
       };
+    case "withdrawn":
+      return {
+        shell: "border-2 border-amber-500/70 bg-transparent",
+        badge: "border-amber-500/60 bg-amber-500/10 text-amber-900 dark:bg-amber-500/15 dark:text-amber-100",
+        label: "Withdrawn",
+        Icon: AlertTriangle,
+      };
     case "failed":
     case "expired":
       return {
@@ -260,6 +273,7 @@ type ToolActionCardState =
   | "executed"
   | "failed"
   | "declined"
+  | "withdrawn"
   | "expired";
 
 /**
@@ -275,6 +289,9 @@ function toolActionCardState(
   if (interaction.status === "pending") return "pending";
   if (interaction.status === "rejected") return "declined";
   if (interaction.status === "expired") return "expired";
+  // A withdrawn approval was never granted, so nothing ran — it must not fall
+  // through to the "running…" default below.
+  if (interaction.status === "withdrawn") return "withdrawn";
   // Terminal execution outcomes take precedence over the coarse interaction
   // status so a self-resolving "running…" advances to its real result.
   if (execStatus === "executed") return "executed";
@@ -322,6 +339,14 @@ function toolActionStatusClasses(state: ToolActionCardState): {
         badge: "border-red-500/60 bg-red-500/10 text-red-900 dark:bg-red-500/15 dark:text-red-100",
         label: "Declined",
         Icon: XCircle,
+        dimmed: true,
+      };
+    case "withdrawn":
+      return {
+        shell: "border-2 border-border bg-transparent",
+        badge: "border-border bg-muted/60 text-muted-foreground",
+        label: "Withdrawn",
+        Icon: Clock,
         dimmed: true,
       };
     case "expired":
@@ -1161,14 +1186,28 @@ function AskUserQuestionsCard({
             <p className="mt-1">No answer was recorded.</p>
           )}
         </div>
+      ) : interaction.status === "withdrawn" ? (
+        <div className="rounded-2xl border border-amber-300/70 bg-amber-50/85 p-4 text-sm leading-6 text-amber-950 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100">
+          <div className="flex items-center gap-2 font-semibold">
+            <AlertTriangle className="h-4 w-4" />
+            {questions.length === 1 ? "Question withdrawn" : "Questions withdrawn"}
+          </div>
+          <p className="mt-1">
+            {interaction.result?.retirement?.reason
+              ?? "The agent that asked this withdrew it. No answer was recorded."}
+          </p>
+        </div>
       ) : interaction.status === "expired" ? (
         <div className="rounded-2xl border border-amber-300/70 bg-amber-50/85 p-4 text-sm leading-6 text-amber-950 dark:border-amber-500/40 dark:bg-amber-500/10 dark:text-amber-100">
           <div className="flex items-center gap-2 font-semibold">
             <AlertTriangle className="h-4 w-4" />
-            {questions.length === 1 ? "Question expired by comment" : "Questions expired by comment"}
+            {interaction.result?.retirement
+              ? (questions.length === 1 ? "Question retired" : "Questions retired")
+              : (questions.length === 1 ? "Question expired by comment" : "Questions expired by comment")}
           </div>
           <p className="mt-1">
-            A later board/user comment superseded this question request. Create a fresh request if answers are still needed.
+            {interaction.result?.retirement?.reason
+              ?? "A later board/user comment superseded this question request. Create a fresh request if answers are still needed."}
           </p>
           {interaction.result?.commentId ? (
             <a

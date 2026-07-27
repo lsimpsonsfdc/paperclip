@@ -178,6 +178,15 @@ export function getRequestConfirmationTargetHref({
 export function buildIssueThreadInteractionSummary(
   interaction: IssueThreadInteraction,
 ) {
+  // Retirement is kind-independent and must never be described in the language
+  // of a verdict, so it short-circuits every per-kind branch below.
+  if (interaction.status === "withdrawn") {
+    return "Withdrawn by the agent that asked";
+  }
+  if (interaction.result?.retirement?.kind === "issue_closed") {
+    return "Retired — issue closed";
+  }
+
   if (interaction.kind === "suggest_tasks") {
     const count = interaction.payload.tasks.length;
     if (interaction.status === "accepted") {

@@ -210,6 +210,9 @@ pnpm paperclipai issue interaction:accept <issue-id> <interaction-id> [--selecte
 pnpm paperclipai issue interaction:reject <issue-id> <interaction-id> [--reason "..."]
 pnpm paperclipai issue interaction:respond <issue-id> <interaction-id> --answers-json '[{"questionId":"q1","optionIds":["yes"]}]'
 pnpm paperclipai issue interaction:cancel <issue-id> <interaction-id> [--reason "..."]
+# Withdraw is the only interaction resolution an agent may run itself, and only
+# on an interaction it created. --reason is required and lands in the thread.
+pnpm paperclipai issue interaction:withdraw <issue-id> <interaction-id> --reason "..."
 ```
 
 ```sh

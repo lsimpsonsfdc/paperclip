@@ -31,6 +31,8 @@ import {
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
   cancelIssueThreadInteractionSchema,
+  withdrawIssueThreadInteractionSchema,
+  retireIssueThreadInteractionsSchema,
   companySearchExtractQuerySchema,
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
@@ -96,6 +98,7 @@ import {
 import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
+import type { RetireIssueThreadInteractions } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import * as serviceIndex from "../services/index.js";
 import {
@@ -4398,6 +4401,36 @@ export function issueRoutes(
       logger.warn(
         { err, issueId: issue.id, executionWorkspaceId: issue.executionWorkspaceId ?? null },
         "failed to destroy reusable sandbox leases for terminal issue",
+      );
+    }
+  }
+
+  /**
+   * Retire every pending interaction on an issue that just reached a terminal
+   * status. Nobody is going to work the issue again, so a pending ask on it is
+   * pure noise in the operator's decision inbox.
+   *
+   * Best-effort by design: a failure here must never fail the status
+   * transition that triggered it. The periodic sweep re-attempts anything
+   * missed here, including the closes that bypass this route entirely.
+   */
+  async function retirePendingInteractionsForTerminalIssue(issue: {
+    id: string;
+    companyId: string;
+    status: string;
+  }) {
+    try {
+      const retired = await issueThreadInteractionService(db).retirePendingForClosedIssue(issue);
+      if (retired.length > 0) {
+        logger.info(
+          { issueId: issue.id, status: issue.status, retiredCount: retired.length },
+          "retired pending issue-thread interactions for terminal issue",
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { err, issueId: issue.id, status: issue.status },
+        "failed to retire pending issue-thread interactions for terminal issue",
       );
     }
   }
@@ -8907,6 +8940,7 @@ export function issueRoutes(
         !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
       if (becameTerminal) {
         await destroyReusableSandboxLeasesForTerminalIssue(issue);
+        await retirePendingInteractionsForTerminalIssue(issue);
       }
       if (becameTerminal && issue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
@@ -9633,6 +9667,148 @@ export function issueRoutes(
       });
 
       res.json(interaction);
+    },
+  );
+
+  /**
+   * Withdraw — the creator retracts its own pending ask.
+   *
+   * Deliberately NOT fenced by `rejectAgentIssueThreadInteractionResolution`:
+   * that fence guards *resolution* (accept/reject/respond/verdicts/cancel),
+   * which stays board-only. Withdrawing is the opposite direction — it removes
+   * a decision from the operator's inbox rather than making one — so the
+   * authorization basis is authorship, enforced in the service against
+   * `createdByAgentId`.
+   *
+   * Note it is also not gated on the issue mutation lock. An agent must be able
+   * to retract an ask it created even after the issue was reassigned, which is
+   * exactly the case that otherwise strands a dead interaction forever. Read
+   * access is still enforced, so an agent cannot probe outside its boundary.
+   */
+  router.post(
+    "/issues/:id/interactions/:interactionId/withdraw",
+    validate(withdrawIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type === "agent") {
+        if (!(await assertIssueReadAllowed(req, res, issue))) return;
+      } else {
+        assertBoard(req);
+      }
+
+      const actor = getActorInfo(req);
+      const interaction = await issueThreadInteractionService(db).withdrawInteraction(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      const reason = interaction.result?.retirement?.reason ?? null;
+      // The reason has to land in the thread, not just the row: the operator
+      // saw the ask appear in their inbox and needs to see why it vanished.
+      let withdrawalComment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
+      try {
+        withdrawalComment = await svc.addComment(
+          issue.id,
+          `Withdrew the pending ${interaction.kind} interaction${
+            interaction.title ? ` "${interaction.title}"` : ""
+          }. Reason: ${reason ?? "(none given)"}`,
+          {
+            agentId: actor.agentId ?? undefined,
+            userId: actor.actorType === "user" ? actor.actorId : undefined,
+            runId: actor.runId,
+          },
+          { authorType: actor.agentId ? "agent" : "user" },
+        );
+      } catch (err) {
+        // A failed thread note must not roll back an already-withdrawn row —
+        // the row is the source of truth and re-withdrawing would 409.
+        logger.warn(
+          { err, issueId: issue.id, interactionId: interaction.id },
+          "failed to write withdrawal note to issue thread",
+        );
+      }
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_withdrawn",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          withdrawalReason: reason,
+          commentId: withdrawalComment?.id ?? null,
+        },
+      });
+
+      // No continuation wake: the creator is the one withdrawing, so waking it
+      // on its own withdrawal would be a self-triggered loop.
+      res.json(interaction);
+    },
+  );
+
+  /**
+   * Board-only bulk retirement of pending interactions, so clearing an
+   * accumulated decision backlog is one call rather than N operator clicks.
+   *
+   * Agent actors are rejected outright: bulk retirement can touch interactions
+   * an agent did not author, which is exactly the authority the per-interaction
+   * withdraw route is scoped to withhold. Send `dryRun: true` first — it
+   * reports the exact set that would change without writing.
+   */
+  router.post(
+    "/companies/:companyId/issue-interactions/retire",
+    validate(retireIssueThreadInteractionsSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertBoard(req);
+      assertCompanyAccess(req, companyId);
+
+      const body = req.body as RetireIssueThreadInteractions;
+      const actor = getActorInfo(req);
+      const result = await issueThreadInteractionService(db).retireInteractionsBulk(
+        companyId,
+        body.mode === "explicit"
+          ? { mode: "explicit", targets: body.targets }
+          : { mode: "closed_issues" },
+        { reason: body.reason, dryRun: body.dryRun },
+      );
+
+      if (!result.dryRun && result.retiredCount > 0) {
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.thread_interactions_bulk_retired",
+          entityType: "company",
+          entityId: companyId,
+          details: {
+            mode: body.mode,
+            matchedCount: result.matchedCount,
+            retiredCount: result.retiredCount,
+            reason: body.reason ?? null,
+          },
+        });
+      }
+
+      res.json(result);
     },
   );
 
@@ -10437,6 +10613,7 @@ export function issueRoutes(
         ["done", "cancelled"].includes(currentIssue.status);
       if (becameTerminal) {
         await destroyReusableSandboxLeasesForTerminalIssue(currentIssue);
+        await retirePendingInteractionsForTerminalIssue(currentIssue);
       }
       if (becameTerminal && currentIssue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(currentIssue.parentId);

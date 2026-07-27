@@ -723,7 +723,8 @@ export function attentionService(db: Db) {
           decisionVerbs: interactionVerbs(interaction.kind, payload),
           inlineResolvable: true,
           entryRule: "issue_thread_interactions.status = 'pending'",
-          exitRule: "Interaction resolves, expires, fails, or is cancelled.",
+          exitRule:
+            "Interaction resolves, expires, fails, is cancelled, or is withdrawn by its creator.",
           dedupKey,
           severity: "medium",
           activityAt: toIso(interaction.updatedAt),

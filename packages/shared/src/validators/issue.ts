@@ -716,11 +716,38 @@ export const suggestTasksResultCreatedTaskSchema = z.object({
   parentIdentifier: z.string().trim().min(1).nullable().optional(),
 });
 
+/**
+ * Why an interaction was retired without an operator decision. Carried on the
+ * `result` of every interaction kind so the thread records *who* retired the
+ * ask and *why*, and so a retirement is never mistakable for an accept/reject.
+ *
+ * `withdrawn_by_creator` pairs with interaction status `withdrawn` (the author
+ * agent pulled its own ask). `issue_closed` pairs with status `expired` (the
+ * parent issue reached done/cancelled, so the ask is moot).
+ */
+export const issueThreadInteractionRetirementKindSchema = z.enum([
+  "withdrawn_by_creator",
+  "issue_closed",
+]);
+export type IssueThreadInteractionRetirementKind =
+  z.infer<typeof issueThreadInteractionRetirementKindSchema>;
+
+export const issueThreadInteractionRetirementSchema = z.object({
+  version: z.literal(1),
+  kind: issueThreadInteractionRetirementKindSchema,
+  reason: z.string().trim().min(1).max(4000),
+  retiredAt: z.string().datetime({ offset: true }),
+  retiredByAgentId: z.string().uuid().nullable().optional(),
+});
+export type IssueThreadInteractionRetirement =
+  z.infer<typeof issueThreadInteractionRetirementSchema>;
+
 export const suggestTasksResultSchema = z.object({
   version: z.literal(1),
   createdTasks: z.array(suggestTasksResultCreatedTaskSchema).max(50).optional(),
   skippedClientKeys: z.array(z.string().trim().min(1).max(120)).max(50).optional(),
   rejectionReason: z.string().trim().max(4000).nullable().optional(),
+  retirement: issueThreadInteractionRetirementSchema.optional(),
 });
 
 export const askUserQuestionsQuestionOptionSchema = z.object({
@@ -784,6 +811,7 @@ export const askUserQuestionsResultSchema = z.object({
   expirationReason: z.literal("superseded_by_comment").optional(),
   commentId: z.string().uuid().nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
+  retirement: issueThreadInteractionRetirementSchema.optional(),
 });
 
 const requestConfirmationHrefSchema = z.string().trim().min(1).max(2000).refine((value) => {
@@ -975,12 +1003,16 @@ export const requestConfirmationToolActionResultSchema = z.object({
 
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target"]),
+  // `retired` is not a verdict: it means the ask went away (author withdrew it,
+  // or the parent issue closed) without the operator ever deciding. Detail
+  // lives in `retirement`.
+  outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "retired"]),
   reason: z.string().trim().max(4000).nullable().optional(),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
   resumeFailure: requestConfirmationResumeFailureSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionResultSchema.optional(),
+  retirement: issueThreadInteractionRetirementSchema.optional(),
 });
 
 export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
@@ -1097,12 +1129,13 @@ export const requestItemVerdictsResultItemSchema = z.object({
 
 export const requestItemVerdictsResultSchema = z.object({
   version: z.literal(1),
-  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled"]),
+  outcome: z.enum(["resolved", "superseded_by_comment", "stale_target", "cancelled", "retired"]),
   complete: z.boolean(),
   items: z.array(requestItemVerdictsResultItemSchema)
     .max(REQUEST_ITEM_VERDICTS_ITEM_LIMIT),
   commentId: z.string().uuid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
+  retirement: issueThreadInteractionRetirementSchema.optional(),
 }).superRefine((value, ctx) => {
   const itemIds = new Set<string>();
   for (const [index, item] of value.items.entries()) {
@@ -1215,6 +1248,51 @@ export const cancelIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
 });
 export type CancelIssueThreadInteraction = z.infer<typeof cancelIssueThreadInteractionSchema>;
+
+/**
+ * Withdraw is not resolve: the *creator* retracts its own pending ask. A reason
+ * is mandatory (unlike cancel) because the withdrawal is written into the issue
+ * thread and the operator needs to know why the ask disappeared.
+ */
+export const withdrawIssueThreadInteractionSchema = z.object({
+  reason: z.string().trim().min(1).max(4000),
+}).strict();
+export type WithdrawIssueThreadInteraction = z.infer<typeof withdrawIssueThreadInteractionSchema>;
+
+export const retireIssueThreadInteractionsTargetSchema = z.object({
+  issueId: z.string().uuid(),
+  interactionId: z.string().uuid(),
+}).strict();
+export type RetireIssueThreadInteractionsTarget =
+  z.infer<typeof retireIssueThreadInteractionsTargetSchema>;
+
+export const RETIRE_ISSUE_THREAD_INTERACTIONS_TARGET_LIMIT = 1000;
+
+/**
+ * Board-only bulk retirement, so an operator clearing an accumulated backlog is
+ * never asked to click through it one interaction at a time.
+ *
+ * `mode: "closed_issues"` retires every pending interaction whose parent issue
+ * is already done/cancelled. `mode: "explicit"` retires a supplied list of
+ * (issueId, interactionId) pairs. `dryRun` reports what would change without
+ * writing.
+ */
+export const retireIssueThreadInteractionsSchema = z.discriminatedUnion("mode", [
+  z.object({
+    mode: z.literal("closed_issues"),
+    reason: z.string().trim().min(1).max(4000).optional(),
+    dryRun: z.boolean().optional(),
+  }).strict(),
+  z.object({
+    mode: z.literal("explicit"),
+    targets: z.array(retireIssueThreadInteractionsTargetSchema)
+      .min(1)
+      .max(RETIRE_ISSUE_THREAD_INTERACTIONS_TARGET_LIMIT),
+    reason: z.string().trim().min(1).max(4000).optional(),
+    dryRun: z.boolean().optional(),
+  }).strict(),
+]);
+export type RetireIssueThreadInteractions = z.infer<typeof retireIssueThreadInteractionsSchema>;
 
 export const respondIssueThreadInteractionSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),

@@ -268,10 +268,25 @@ export const ISSUE_THREAD_INTERACTION_STATUSES = [
   "rejected",
   "answered",
   "cancelled",
+  // Retired by the agent that created it, without an operator ever deciding.
+  // Deliberately distinct from `cancelled` (a board decision) so a withdrawal
+  // can never be read back as an operator verdict.
+  "withdrawn",
   "expired",
   "failed",
 ] as const;
 export type IssueThreadInteractionStatus = (typeof ISSUE_THREAD_INTERACTION_STATUSES)[number];
+
+/**
+ * Interaction statuses that represent "the operator never decided this" — the
+ * ask went away rather than being answered. Consumers that report on operator
+ * decisions should exclude these.
+ */
+export const ISSUE_THREAD_INTERACTION_UNDECIDED_STATUSES = [
+  "cancelled",
+  "withdrawn",
+  "expired",
+] as const;
 
 export const ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES = [
   "none",

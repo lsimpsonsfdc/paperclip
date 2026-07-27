@@ -4,6 +4,7 @@ import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
   cancelIssueThreadInteractionSchema,
+  withdrawIssueThreadInteractionSchema,
   checkoutIssueSchema,
   createChildIssueSchema,
   createIssueLabelSchema,
@@ -765,6 +766,14 @@ export function registerIssueCommands(program: Command): void {
   for (const [name, action, schema, description] of [
     ["interaction:reject", "reject", rejectIssueThreadInteractionSchema, "Reject an issue thread interaction"],
     ["interaction:cancel", "cancel", cancelIssueThreadInteractionSchema, "Cancel an issue thread interaction"],
+    // Withdraw is agent-usable (the creator retracts its own ask); reject and
+    // cancel remain board-only. --reason is required here, not optional.
+    [
+      "interaction:withdraw",
+      "withdraw",
+      withdrawIssueThreadInteractionSchema,
+      "Withdraw a pending issue thread interaction you created",
+    ],
   ] as const) {
     addCommonClientOptions(
       issue

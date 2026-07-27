@@ -7,6 +7,7 @@ const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
+  addComment: vi.fn(async () => ({ id: "comment-withdrawal" })),
 }));
 
 const mockInteractionService = vi.hoisted(() => ({
@@ -20,6 +21,9 @@ const mockInteractionService = vi.hoisted(() => ({
   answerQuestions: vi.fn(),
   submitItemVerdicts: vi.fn(),
   cancelQuestions: vi.fn(),
+  withdrawInteraction: vi.fn(),
+  retirePendingForClosedIssue: vi.fn(async () => []),
+  retireInteractionsBulk: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -1298,5 +1302,127 @@ describe.sequential("issue thread interaction routes", () => {
         userId: null,
       },
     );
+  });
+
+  it("lets an agent withdraw an interaction it created without board credentials", async () => {
+    mockInteractionService.withdrawInteraction.mockResolvedValueOnce({
+      id: "interaction-2",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_confirmation",
+      status: "withdrawn",
+      continuationPolicy: "wake_assignee",
+      title: "Ship it?",
+      payload: { version: 1, prompt: "Ship it?" },
+      result: {
+        version: 1,
+        outcome: "retired",
+        retirement: {
+          version: 1,
+          kind: "withdrawn_by_creator",
+          reason: "Superseded by a newer ask.",
+          retiredAt: "2026-04-20T12:05:00.000Z",
+          retiredByAgentId: CREATED_AGENT_ID,
+        },
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({ reason: "Superseded by a newer ask." });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("withdrawn");
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      { reason: "Superseded by a newer ask." },
+      { agentId: CREATED_AGENT_ID, userId: null },
+    );
+    // The reason has to reach the thread, not just the row: the operator saw
+    // the ask appear and needs to see why it vanished.
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      expect.stringContaining("Superseded by a newer ask."),
+      expect.objectContaining({ agentId: CREATED_AGENT_ID }),
+      expect.objectContaining({ authorType: "agent" }),
+    );
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_withdrawn",
+        details: expect.objectContaining({
+          withdrawalReason: "Superseded by a newer ask.",
+          commentId: "comment-withdrawal",
+        }),
+      }),
+    );
+    // Withdrawing is not a decision, so no continuation wake fires — waking the
+    // withdrawing agent on its own withdrawal would be a self-triggered loop.
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("rejects a withdrawal with no reason", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({});
+
+    expect(res.status).toBe(400);
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
+  it("keeps accept, reject and cancel board-only for agent actors", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    for (const action of ["accept", "reject", "cancel"] as const) {
+      const res = await request(app)
+        .post(`/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/${action}`)
+        .send({});
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("board-only route");
+    }
+
+    expect(mockInteractionService.acceptInteraction).not.toHaveBeenCalled();
+    expect(mockInteractionService.rejectInteraction).not.toHaveBeenCalled();
+    expect(mockInteractionService.cancelQuestions).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent actors from the board-only bulk retire endpoint", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issue-interactions/retire")
+      .send({ mode: "closed_issues" });
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.retireInteractionsBulk).not.toHaveBeenCalled();
   });
 });
