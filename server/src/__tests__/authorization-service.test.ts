@@ -1,13 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
 import {
   agents,
   authUsers,
   companies,
   companyMemberships,
   createDb,
+  documentRevisions,
+  documents,
   instanceUserRoles,
   issueComments,
+  issueDocuments,
   issues,
   principalPermissionGrants,
   projects,
@@ -75,6 +79,7 @@ async function createIssue(
     projectId?: string | null;
     parentId?: string | null;
     assigneeAgentId?: string | null;
+    createdByAgentId?: string | null;
     originKind?: string | null;
     originId?: string | null;
   } = {},
@@ -90,11 +95,53 @@ async function createIssue(
       projectId: input.projectId ?? null,
       parentId: input.parentId ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
+      createdByAgentId: input.createdByAgentId ?? null,
       originKind: input.originKind ?? "manual",
       originId: input.originId ?? null,
     })
     .returning()
     .then((rows) => rows[0]!);
+}
+
+async function createDocumentRevisionOnIssue(
+  db: ReturnType<typeof createDb>,
+  companyId: string,
+  issueId: string,
+  input: { authorAgentId?: string | null; key?: string } = {},
+) {
+  const document = await db
+    .insert(documents)
+    .values({
+      companyId,
+      title: `Document ${randomUUID()}`,
+      latestBody: "test body",
+      createdByAgentId: input.authorAgentId ?? null,
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+
+  const revision = await db
+    .insert(documentRevisions)
+    .values({
+      companyId,
+      documentId: document.id,
+      revisionNumber: 1,
+      body: "test body",
+      createdByAgentId: input.authorAgentId ?? null,
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+
+  await db.update(documents).set({ latestRevisionId: revision.id }).where(eq(documents.id, document.id));
+
+  await db.insert(issueDocuments).values({
+    companyId,
+    issueId,
+    documentId: document.id,
+    key: input.key ?? `doc-${randomUUID()}`,
+  });
+
+  return { document, revision };
 }
 
 async function grantAgentPermission(
@@ -173,6 +220,9 @@ describeEmbeddedPostgres("authorization service", () => {
 
   afterEach(async () => {
     await db.delete(issueComments);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
     await db.delete(userInboxAgentPolicies);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -1386,6 +1436,205 @@ describeEmbeddedPostgres("authorization service", () => {
       allowed: true,
       reason: "allow_issue_mention_grant",
     });
+  });
+
+  it("allows a non-assignee who authored a document revision on the issue to comment", async () => {
+    const company = await createCompany(db, "AuthorshipCommentGrant");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const authorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Authorship-scoped comment target",
+      assigneeAgentId: assigneeAgent.id,
+    });
+    await createDocumentRevisionOnIssue(db, company.id, issue.id, { authorAgentId: authorAgent.id });
+
+    const actor = { type: "agent", agentId: authorAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_authorship_grant",
+    });
+  });
+
+  it("allows the issue creator who is not the assignee to comment", async () => {
+    const company = await createCompany(db, "CreatorCommentGrant");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const creatorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Creator-scoped comment target",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+
+    const actor = { type: "agent", agentId: creatorAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: true,
+      reason: "allow_issue_creator_grant",
+    });
+  });
+
+  it("keeps denying comment access for an unrelated same-company agent with no authorship, creation, or mention relationship", async () => {
+    const company = await createCompany(db, "UnrelatedAgentCommentDenied");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const creatorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const authorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const unrelatedAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Unrelated agent comment denial target",
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: creatorAgent.id,
+    });
+    await createDocumentRevisionOnIssue(db, company.id, issue.id, { authorAgentId: authorAgent.id });
+
+    const actor = { type: "agent", agentId: unrelatedAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("does not widen issue:mutate for a document revision author who is not the assignee", async () => {
+    const company = await createCompany(db, "AuthorshipMutateDenied");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const authorAgent = await createAgent(db, company.id, { role: "engineer" });
+    const issue = await createIssue(db, company.id, {
+      title: "Authorship mutate-denial target",
+      assigneeAgentId: assigneeAgent.id,
+    });
+    await createDocumentRevisionOnIssue(db, company.id, issue.id, { authorAgentId: authorAgent.id });
+
+    const actor = { type: "agent", agentId: authorAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_missing_grant",
+    });
+  });
+
+  it("keeps the authorship grant company-scoped for a cross-company revision author", async () => {
+    const companyA = await createCompany(db, "AuthorshipCrossCompanyA");
+    const companyB = await createCompany(db, "AuthorshipCrossCompanyB");
+    const assigneeAgent = await createAgent(db, companyA.id, { role: "engineer" });
+    // Agent belongs to company B but a document_revisions row references it as the
+    // author on a company-A document, simulating a cross-company data anomaly.
+    const foreignAgent = await createAgent(db, companyB.id, { role: "engineer" });
+    const issue = await createIssue(db, companyA.id, {
+      title: "Cross-company authorship denial target",
+      assigneeAgentId: assigneeAgent.id,
+    });
+    await createDocumentRevisionOnIssue(db, companyA.id, issue.id, { authorAgentId: foreignAgent.id });
+
+    const actor = { type: "agent", agentId: foreignAgent.id, companyId: companyA.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: companyA.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_company_boundary",
+    });
+  });
+
+  it("keeps the low-trust boundary denial unaffected by authorship or creator relationships", async () => {
+    const company = await createCompany(db, "AuthorshipLowTrustUnchanged");
+    const allowedProject = await createProject(db, company.id, "AuthorshipLowTrustAllowed");
+    const targetProject = await createProject(db, company.id, "AuthorshipLowTrustTarget");
+    const assigneeAgent = await createAgent(db, company.id, { role: "engineer" });
+    const lowTrustAgent = await createAgent(db, company.id, {
+      role: "engineer",
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: company.id,
+            projectIds: [allowedProject.id],
+          },
+        },
+      },
+    });
+    const issue = await createIssue(db, company.id, {
+      title: "Low-trust authorship/creator target",
+      projectId: targetProject.id,
+      assigneeAgentId: assigneeAgent.id,
+      createdByAgentId: lowTrustAgent.id,
+    });
+    await createDocumentRevisionOnIssue(db, company.id, issue.id, { authorAgentId: lowTrustAgent.id });
+
+    const actor = { type: "agent", agentId: lowTrustAgent.id, companyId: company.id, source: "agent_key" } as const;
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      assigneeAgentId: assigneeAgent.id,
+      status: issue.status,
+    } as const;
+
+    await expect(authorizationService(db).decide({
+      actor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
   });
 
   it("limits viewer members to read-only visibility actions", async () => {

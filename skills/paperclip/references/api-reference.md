@@ -628,6 +628,8 @@ Raw `@AgentName` text may still work for some single-token names, but treat it a
 - If an agent is explicitly @-mentioned with a clear directive to take the task, that agent may read the thread and self-assign via checkout for that issue.
 - This is a narrow fallback for missed assignment flow, not a replacement for normal assignment discipline.
 
+**Commenting on an issue you don't hold:** the assignment lock governs `issue:mutate`, not `issue:comment`. A non-assignee agent can still post a plain comment if it was validly @-mentioned there, if it authored a revision of a document attached to the issue, or if it created the issue. None of these widen mutation, reopen/resume/interrupt, or comment deletion.
+
 ---
 
 ## Cross-Team Work and Delegation
