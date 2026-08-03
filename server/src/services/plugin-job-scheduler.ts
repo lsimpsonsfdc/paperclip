@@ -36,7 +36,7 @@
 
 import { and, eq, lte, or } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { pluginJobs, pluginJobRuns } from "@paperclipai/db";
+import { companies, pluginJobs, pluginJobRuns } from "@paperclipai/db";
 import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
@@ -337,6 +337,37 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /**
+   * Resolve a company to attach to a scheduled job's invocation scope.
+   *
+   * `runJob` calls otherwise carry no company context at all, which makes
+   * any company-gated worker→host call (`config.get` in particular) fail
+   * with `INVOCATION_SCOPE_DENIED` unconditionally — not something a plugin
+   * can work around from its own code. This picks the oldest active company
+   * as a stable, deterministic anchor so `config.get()` etc. have something
+   * to authorize against. It intentionally does NOT fan the job out per
+   * company — one shared external resource (an API account, a subscription)
+   * gets one poll, and the result is still stored/read instance-wide via
+   * `ctx.state`, which is unaffected by this scope requirement.
+   *
+   * Returns null (and the run proceeds with no company scope, exactly as
+   * before this change) when there's no active company yet — e.g. a fresh
+   * instance mid-onboarding.
+   *
+   * @see doc/plugins/COMPANY_SCOPED_JOB_INVOCATION.md for the full design
+   *   note, including the broader per-company fan-out alternative this
+   *   deliberately does not implement.
+   */
+  async function resolveFallbackCompanyId(): Promise<string | null> {
+    const rows = await db
+      .select({ id: companies.id })
+      .from(companies)
+      .where(eq(companies.status, "active"))
+      .orderBy(companies.createdAt)
+      .limit(1);
+    return rows[0]?.id ?? null;
+  }
+
+  /**
    * Dispatch a single job run — create the run record, call the worker,
    * record the result, and advance the schedule pointer.
    */
@@ -353,15 +384,18 @@ export function createPluginJobScheduler(
     const startedAt = Date.now();
 
     try {
+      const companyId = await resolveFallbackCompanyId();
+
       // 1. Create run record
       const run = await jobStore.createRun({
         jobId,
         pluginId,
         trigger: "schedule",
+        companyId,
       });
       runId = run.id;
 
-      jobLog.info({ runId }, "dispatching scheduled job");
+      jobLog.info({ runId, companyId }, "dispatching scheduled job");
 
       // 2. Mark run as running
       await jobStore.markRunning(runId);
@@ -371,6 +405,10 @@ export function createPluginJobScheduler(
         pluginId,
         "runJob",
         {
+          // Top-level companyId (not nested under `job`) so the host's
+          // generic invocation-scope derivation picks it up — see
+          // deriveInvocationScope() in plugin-worker-manager.ts.
+          companyId,
           job: {
             jobKey,
             runId,
@@ -482,15 +520,21 @@ export function createPluginJobScheduler(
       );
     }
 
+    // Resolved once here (not inside dispatchManualRun) so it's captured
+    // before the non-blocking dispatch fires — same rationale as the
+    // scheduled path, see resolveFallbackCompanyId().
+    const companyId = await resolveFallbackCompanyId();
+
     // Create the run and dispatch (non-blocking)
     const run = await jobStore.createRun({
       jobId,
       pluginId: job.pluginId,
       trigger,
+      companyId,
     });
 
     // Dispatch in background — don't block the caller
-    void dispatchManualRun(job, run.id, trigger);
+    void dispatchManualRun(job, run.id, trigger, companyId);
 
     return { runId: run.id, jobId };
   }
@@ -502,6 +546,7 @@ export function createPluginJobScheduler(
     job: typeof pluginJobs.$inferSelect,
     runId: string,
     trigger: "manual" | "retry",
+    companyId: string | null,
   ): Promise<void> {
     const { id: jobId, pluginId, jobKey } = job;
     const jobLog = log.child({ jobId, pluginId, jobKey, runId, trigger });
@@ -516,6 +561,7 @@ export function createPluginJobScheduler(
         pluginId,
         "runJob",
         {
+          companyId,
           job: {
             jobKey,
             runId,

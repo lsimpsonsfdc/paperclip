@@ -1702,7 +1702,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (!handler) {
       throw new Error(`No handler registered for job "${params.job.jobKey}"`);
     }
-    await handler(params.job);
+    await handler({ ...params.job, companyId: params.companyId ?? null });
   }
 
   async function handleWebhook(params: PluginWebhookInput): Promise<void> {

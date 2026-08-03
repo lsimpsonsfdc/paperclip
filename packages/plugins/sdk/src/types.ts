@@ -238,6 +238,15 @@ export interface PluginJobContext {
   trigger: "schedule" | "manual" | "retry";
   /** ISO 8601 timestamp when the run was scheduled to start. */
   scheduledAt: string;
+  /**
+   * Company the scheduler resolved to anchor this run's invocation scope,
+   * or null if none was available. A job handler does not need to read this
+   * to use `ctx.config.get()` — the host already scoped the invocation, so
+   * a bare `ctx.config.get()` call resolves against it automatically. It's
+   * exposed for logging/telemetry and for callers doing company-gated work
+   * beyond config (e.g. `ctx.costs`) directly from the job handler.
+   */
+  companyId?: string | null;
 }
 
 // ---------------------------------------------------------------------------

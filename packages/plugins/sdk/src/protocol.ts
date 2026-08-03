@@ -379,6 +379,14 @@ export interface OnEventParams {
 export interface RunJobParams {
   /** Job execution context. */
   job: PluginJobContext;
+  /**
+   * Host-authorized company scope for this run, when the scheduler resolved
+   * one. NULL when no active company exists yet. This exists so
+   * company-gated worker→host calls (e.g. `config.get`) can succeed from
+   * inside a job handler — see doc/plugins/COMPANY_SCOPED_JOB_INVOCATION.md.
+   * It does not imply per-company fan-out: a job still runs once per tick.
+   */
+  companyId?: string | null;
 }
 
 /**
