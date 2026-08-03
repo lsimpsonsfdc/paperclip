@@ -62,6 +62,12 @@ export interface CreateJobRunInput {
   pluginId: string;
   /** What triggered this run. */
   trigger: PluginJobRunTrigger;
+  /**
+   * Company scope for this run, when the scheduler resolved one to satisfy
+   * company-gated worker→host calls (e.g. `config.get`). NULL for jobs that
+   * don't need one — see doc/plugins/COMPANY_SCOPED_JOB_INVOCATION.md.
+   */
+  companyId?: string | null;
 }
 
 /**
@@ -356,6 +362,7 @@ export function pluginJobStore(db: Db) {
         .values({
           jobId: input.jobId,
           pluginId: input.pluginId,
+          companyId: input.companyId ?? null,
           trigger: input.trigger,
           status: "queued",
         })
