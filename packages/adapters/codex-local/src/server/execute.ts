@@ -41,6 +41,7 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
+  buildInheritedAgentEnvRecord,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseLocalProcessFilesystemScope,
@@ -813,11 +814,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         Object.assign(env, paperclipBridge.env);
       }
     }
-    const effectiveEnv = Object.fromEntries(
-      Object.entries({ ...process.env, ...env }).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    const effectiveEnv = buildInheritedAgentEnvRecord(env);
     const billingType = resolveCodexBillingType(effectiveEnv);
     const networkScope = parseLocalProcessNetworkScope(config.networkScope);
     const filesystemScope = parseLocalProcessFilesystemScope(config.filesystemScope);

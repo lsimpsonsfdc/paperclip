@@ -33,7 +33,6 @@ import {
   buildInvocationEnvForLogs,
   ensureAbsoluteDirectory,
   ensurePaperclipSkillSymlink,
-  ensurePathInEnv,
   refreshPaperclipWorkspaceEnvForExecution,
   renderTemplate,
   renderPaperclipWakePrompt,
@@ -44,6 +43,7 @@ import {
   readPaperclipRuntimeSkillEntries,
   readPaperclipIssueWorkModeFromContext,
   resolvePaperclipDesiredSkillNames,
+  buildInheritedAgentEnvRecord,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl } from "./parse.js";
 import {
@@ -312,11 +312,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const localRuntimeConfigHome =
     preparedRuntimeConfig.notes.length > 0 ? preparedRuntimeConfig.env.XDG_CONFIG_HOME : "";
   try {
-    const runtimeEnv = Object.fromEntries(
-      Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
+    const runtimeEnv = buildInheritedAgentEnvRecord(preparedRuntimeConfig.env, { ensurePath: true });
     const timeoutSec = resolveAdapterExecutionTargetTimeoutSec(
       executionTarget,
       asNumber(config.timeoutSec, 0),
@@ -459,11 +455,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (paperclipBridge) {
         Object.assign(preparedRuntimeConfig.env, paperclipBridge.env);
         loggedEnv = buildInvocationEnvForLogs(preparedRuntimeConfig.env, {
-          runtimeEnv: Object.fromEntries(
-            Object.entries(ensurePathInEnv({ ...process.env, ...preparedRuntimeConfig.env })).filter(
-              (entry): entry is [string, string] => typeof entry[1] === "string",
-            ),
-          ),
+          runtimeEnv: buildInheritedAgentEnvRecord(preparedRuntimeConfig.env, { ensurePath: true }),
           includeRuntimeKeys: ["HOME"],
           resolvedCommand,
         });

@@ -140,4 +140,33 @@ describe("claude_local ACP startup fallback", () => {
 
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
+
+  // SSO-22654: platform signing secrets must never reach a child agent process,
+  // and the deny-list must not break a real run. Both halves are asserted here —
+  // an adapter that is secure but broken is not a passing test.
+  it("keeps platform signing secrets out of the child env while the run still completes", async () => {
+    vi.stubEnv("PAPERCLIP_AGENT_JWT_SECRET", "jwt-signing-secret");
+    vi.stubEnv("BETTER_AUTH_SECRET", "web-session-secret");
+    vi.stubEnv("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", "tool-action-secret");
+    vi.stubEnv("OPENROUTER_API_KEY", "provider-credential");
+    try {
+      const ctx = buildContext();
+
+      const result = await execute(ctx as never);
+
+      expect(result.exitCode).toBe(0);
+      expect(runAdapterExecutionTargetProcess).toHaveBeenCalled();
+      // The merged child environment this adapter builds (buildInheritedAgentEnv)
+      // is handed to command resolution and, for remote targets, to the runtime.
+      const resolveCalls = ensureAdapterExecutionTargetCommandResolvable.mock.calls as unknown as unknown[][];
+      const childEnv = resolveCalls.at(-1)?.[3] as Record<string, string>;
+      expect(childEnv.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(childEnv.BETTER_AUTH_SECRET).toBeUndefined();
+      expect(childEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      // Deny-list polarity: provider credentials are still inherited.
+      expect(childEnv.OPENROUTER_API_KEY).toBe("provider-credential");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

@@ -44,6 +44,8 @@ import {
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections,
+  buildInheritedAgentEnv,
+  buildInheritedAgentEnvRecord,
 } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_CURSOR_LOCAL_MODEL, SANDBOX_INSTALL_COMMAND } from "../index.js";
 import { parseCursorJsonl, isCursorUnknownSessionError } from "./parse.js";
@@ -435,11 +437,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     env = finalSandboxCommand.env;
   }
   const runtimeExecutionTarget = overrideAdapterExecutionTargetRemoteCwd(executionTarget, effectiveExecutionCwd);
-  const effectiveEnv = Object.fromEntries(
-    Object.entries({ ...process.env, ...env }).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+  const effectiveEnv = buildInheritedAgentEnvRecord(env);
   const billingType = resolveCursorBillingType(effectiveEnv);
   const runtimeEnv = ensurePathInEnv(effectiveEnv);
   await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv, {
@@ -465,7 +463,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (paperclipBridge) {
       Object.assign(env, paperclipBridge.env);
       loggedEnv = buildInvocationEnvForLogs(env, {
-        runtimeEnv: ensurePathInEnv({ ...process.env, ...env }),
+        runtimeEnv: buildInheritedAgentEnv(env, { ensurePath: true }),
         includeRuntimeKeys: ["HOME"],
         resolvedCommand,
       });

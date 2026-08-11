@@ -25,16 +25,27 @@ export function deploymentAuthCheck(config: PaperclipConfig): CheckResult {
     };
   }
 
-  const secret =
-    process.env.BETTER_AUTH_SECRET?.trim() ??
-    process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
-  if (!secret) {
+  const webSessionSecret = process.env.BETTER_AUTH_SECRET?.trim();
+  const agentJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+  if (!webSessionSecret && !agentJwtSecret) {
     return {
       name: "Deployment/auth mode",
       status: "fail",
       message: "authenticated mode requires BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET)",
       canRepair: false,
       repairHint: "Set BETTER_AUTH_SECRET before starting Paperclip",
+    };
+  }
+  // Agent-JWT signing no longer falls back to the web-session key: the server
+  // refuses to boot in that configuration (SSO-22654). Surface it in preflight
+  // so operators find out here rather than from a failed start.
+  if (!agentJwtSecret) {
+    return {
+      name: "Deployment/auth mode",
+      status: "fail",
+      message: "PAPERCLIP_AGENT_JWT_SECRET is required; agent JWTs no longer reuse BETTER_AUTH_SECRET",
+      canRepair: false,
+      repairHint: "Generate a dedicated secret (`openssl rand -hex 32`) and set PAPERCLIP_AGENT_JWT_SECRET",
     };
   }
 

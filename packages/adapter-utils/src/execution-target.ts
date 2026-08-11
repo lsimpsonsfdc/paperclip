@@ -30,6 +30,7 @@ import {
 } from "./sandbox-run-log-stream.js";
 import { createSshCommandManagedRuntimeRunner, parseSshRemoteExecutionSpec, runSshCommand, shellQuote } from "./ssh.js";
 import {
+  AGENT_ENV_DENY_LIST,
   ensureCommandResolvable,
   resolveCommandForLogs,
   runChildProcess,
@@ -1645,9 +1646,21 @@ function writeEvent(event) {
   return write;
 }
 
+// Mirror of AGENT_ENV_DENY_LIST, embedded because this source runs on the
+// remote host with no access to @paperclipai/adapter-utils. Kept in sync by
+// agent-env-chokepoint.test.ts.
+const AGENT_ENV_DENY_LIST = ${JSON.stringify([...AGENT_ENV_DENY_LIST])};
+function buildRemoteChildEnv(overrides) {
+  const merged = { ...process.env, ...overrides };
+  for (const key of Object.keys(merged)) {
+    if (AGENT_ENV_DENY_LIST.includes(key.toUpperCase())) delete merged[key];
+  }
+  return merged;
+}
+
 const child = spawn(config.command, Array.isArray(config.args) ? config.args : [], {
   cwd: config.cwd || process.cwd(),
-  env: { ...process.env, ...(config.env || {}) },
+  env: buildRemoteChildEnv(config.env || {}),
   stdio: ["pipe", "pipe", "pipe"],
 });
 

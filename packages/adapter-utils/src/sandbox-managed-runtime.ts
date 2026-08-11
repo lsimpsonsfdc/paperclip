@@ -26,6 +26,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { buildInheritedAgentEnv } from "./server-utils.js";
 
 const execFile = promisify(execFileCallback);
 const SANDBOX_WORKSPACE_HEAVY_DIR_NAMES = [
@@ -389,10 +390,7 @@ async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): 
 
 async function execTar(args: string[]): Promise<void> {
   await execFile("tar", args, {
-    env: {
-      ...process.env,
-      COPYFILE_DISABLE: "1",
-    },
+    env: buildInheritedAgentEnv({ COPYFILE_DISABLE: "1" }),
     maxBuffer: 32 * 1024 * 1024,
   });
 }

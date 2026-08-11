@@ -30,6 +30,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
+import { assertAgentJwtSecretConfigured } from "./agent-auth-jwt.js";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
@@ -120,6 +121,9 @@ export async function startServer(): Promise<StartedServer> {
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   let config = loadConfig();
+  // Fail closed before anything else boots if this deployment is still relying
+  // on the removed BETTER_AUTH_SECRET fallback for agent-JWT signing (SSO-22654).
+  assertAgentJwtSecretConfigured();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {
     process.env.PAPERCLIP_SECRETS_PROVIDER = config.secretsProvider;

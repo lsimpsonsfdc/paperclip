@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
-import type { RunProcessResult } from "./server-utils.js";
+import { buildInheritedAgentEnv, type RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
@@ -409,11 +409,10 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
+  return buildInheritedAgentEnv({
     // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
     COPYFILE_DISABLE: "1",
-  };
+  });
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.

@@ -38,6 +38,7 @@ import {
   selectPaperclipTaskMarkdown,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
+  buildInheritedAgentEnvRecord,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -463,11 +464,10 @@ export async function execute(
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
-  const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+  const env: Record<string, string> = buildInheritedAgentEnvRecord({
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
-  };
+  });
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 

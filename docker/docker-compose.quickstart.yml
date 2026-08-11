@@ -3,6 +3,7 @@
 #
 #   cd docker
 #   export BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
+#   export PAPERCLIP_AGENT_JWT_SECRET="$(openssl rand -hex 32)"
 #   export ANTHROPIC_API_KEY="sk-ant-..."
 #   docker compose -f docker-compose.quickstart.yml up --build
 #
@@ -29,8 +30,11 @@ services:
       # Base URL users will access the UI at
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://localhost:3100}"
 
-      # ── Required secret for session signing (generate with: openssl rand -hex 32) ──
+      # ── Required secrets (generate each with: openssl rand -hex 32) ──
+      # Web session signing.
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # Agent run JWT signing. Must be a different value from BETTER_AUTH_SECRET.
+      PAPERCLIP_AGENT_JWT_SECRET: "${PAPERCLIP_AGENT_JWT_SECRET:?PAPERCLIP_AGENT_JWT_SECRET must be set}"
     volumes:
       # Persistent data directory (database, agent workspaces, uploads)
       - "${PAPERCLIP_DATA_DIR:-../data/docker-paperclip}:/paperclip"

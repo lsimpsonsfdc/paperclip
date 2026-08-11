@@ -1,6 +1,11 @@
 import { createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createLocalAgentJwt, verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import {
+  AgentJwtSecretFallbackError,
+  assertAgentJwtSecretConfigured,
+  createLocalAgentJwt,
+  verifyLocalAgentJwt,
+} from "../agent-auth-jwt.js";
 
 describe("agent local JWT", () => {
   const secretEnv = "PAPERCLIP_AGENT_JWT_SECRET";
@@ -86,20 +91,31 @@ describe("agent local JWT", () => {
     expect(verifyLocalAgentJwt("abc.def.ghi")).toBeNull();
   });
 
-  it("falls back to BETTER_AUTH_SECRET when PAPERCLIP_AGENT_JWT_SECRET is absent", () => {
+  // SSO-22654: signing agent JWTs with the better-auth web-session key shared
+  // one key across two trust domains. The fallback now fails closed instead.
+  it("fails loud instead of falling back to BETTER_AUTH_SECRET", () => {
     delete process.env[secretEnv];
     process.env[betterAuthSecretEnv] = "fallback-secret";
     vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-    const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
-    expect(typeof token).toBe("string");
 
-    const claims = verifyLocalAgentJwt(token!);
-    expect(claims).toMatchObject({
-      sub: "agent-1",
-      company_id: "company-1",
-      adapter_type: "claude_local",
-      run_id: "run-1",
-    });
+    expect(() => createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1"))
+      .toThrow(AgentJwtSecretFallbackError);
+    // The error must name the var to set and state the fix.
+    expect(() => assertAgentJwtSecretConfigured()).toThrow(/PAPERCLIP_AGENT_JWT_SECRET/);
+    expect(() => assertAgentJwtSecretConfigured()).toThrow(/openssl rand -hex 32/);
+  });
+
+  it("boot guard passes when the dedicated agent JWT secret is set", () => {
+    process.env[secretEnv] = "dedicated-secret";
+    process.env[betterAuthSecretEnv] = "web-session-secret";
+    expect(() => assertAgentJwtSecretConfigured()).not.toThrow();
+  });
+
+  it("boot guard stays quiet when neither secret is configured (unauthenticated dev)", () => {
+    delete process.env[secretEnv];
+    delete process.env[betterAuthSecretEnv];
+    expect(() => assertAgentJwtSecretConfigured()).not.toThrow();
+    expect(createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1")).toBeNull();
   });
 
   it("rejects expired tokens", () => {

@@ -7,8 +7,8 @@ import {
   asNumber,
   asString,
   asStringArray,
-  ensurePathInEnv,
   parseObject,
+  buildInheritedAgentEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   describeAdapterExecutionTarget,
@@ -143,7 +143,7 @@ export async function testEnvironment(
   }
 
   const env = normalizeEnv(config.env);
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  const runtimeEnv = buildInheritedAgentEnv(env, { ensurePath: true });
 
   try {
     await ensureAdapterExecutionTargetCommandResolvable(command, target, cwd, runtimeEnv);
