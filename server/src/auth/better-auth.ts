@@ -12,6 +12,8 @@ import {
 } from "@paperclipai/db";
 import type { Config } from "../config.js";
 import { resolvePaperclipInstanceId } from "../home-paths.js";
+import { resolveAgentJwtSecretValue } from "../agent-auth-jwt.js";
+import { resolveFileBackedSecret, type ResolvedSecret } from "../secrets/file-backed-secret.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -144,10 +146,21 @@ export function deriveAuthTrustedOrigins(config: Config, opts?: { listenPort?: n
   return Array.from(trustedOrigins);
 }
 
+/**
+ * Resolve the Better Auth session secret, preferring BETTER_AUTH_SECRET_FILE /
+ * BETTER_AUTH_SECRET over the PAPERCLIP_AGENT_JWT_SECRET_FILE /
+ * PAPERCLIP_AGENT_JWT_SECRET fallback.
+ */
+export function resolveBetterAuthSecret(env: NodeJS.ProcessEnv = process.env): ResolvedSecret {
+  const direct = resolveFileBackedSecret("BETTER_AUTH_SECRET", env);
+  if (direct.value) return direct;
+  return resolveAgentJwtSecretValue(env);
+}
+
 export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins: string[]): BetterAuthInstance {
   const baseUrl = config.authBaseUrlMode === "explicit" ? config.authPublicBaseUrl : undefined;
   const publicUrl = process.env.PAPERCLIP_PUBLIC_URL?.trim() || baseUrl;
-  const secret = process.env.BETTER_AUTH_SECRET ?? process.env.PAPERCLIP_AGENT_JWT_SECRET;
+  const secret = resolveBetterAuthSecret().value;
   if (!secret) {
     throw new Error(
       "BETTER_AUTH_SECRET (or PAPERCLIP_AGENT_JWT_SECRET) must be set. " +

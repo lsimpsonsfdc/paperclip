@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolvePaperclipConfigPath, resolvePaperclipEnvPath } from "./paths.js";
 import type { BindMode, DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
+import { resolveAgentJwtSecretValue } from "./agent-auth-jwt.js";
+import { resolveBetterAuthSecret } from "./auth/better-auth.js";
+import { resolveFileBackedSecret, type ResolvedSecret } from "./secrets/file-backed-secret.js";
 
 import { parse as parseEnvFileContents } from "dotenv";
 
@@ -66,34 +69,44 @@ function redactConnectionString(raw: string): string {
   }
 }
 
-function resolveAgentJwtSecretStatus(
-  envFilePath: string,
-): {
+type SecretStatus = {
   status: "pass" | "warn";
   message: string;
-} {
-  const envValue = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
-  if (envValue) {
+};
+
+/**
+ * Report where a root-of-trust secret's value came from -- "file" (loaded
+ * from its `<NAME>_FILE` path) or "env" (the plain env var) -- never the
+ * value itself. Falls back to the dotenv-file-present-but-not-loaded /
+ * missing detection that predates `_FILE` support.
+ */
+function describeSecretStatus(input: {
+  resolved: ResolvedSecret;
+  envVarName: string;
+  envFilePath: string;
+  missingMessage?: string;
+}): SecretStatus {
+  if (input.resolved.value) {
     return {
       status: "pass",
-      message: "set",
+      message: input.resolved.source === "file" ? "set (file)" : "set (env)",
     };
   }
 
-  if (existsSync(envFilePath)) {
-    const parsed = parseEnvFileContents(readFileSync(envFilePath, "utf-8"));
-    const fileValue = typeof parsed.PAPERCLIP_AGENT_JWT_SECRET === "string" ? parsed.PAPERCLIP_AGENT_JWT_SECRET.trim() : "";
+  if (existsSync(input.envFilePath)) {
+    const parsed = parseEnvFileContents(readFileSync(input.envFilePath, "utf-8"));
+    const fileValue = typeof parsed[input.envVarName] === "string" ? parsed[input.envVarName].trim() : "";
     if (fileValue) {
       return {
         status: "warn",
-        message: `found in ${envFilePath} but not loaded`,
+        message: `found in ${input.envFilePath} but not loaded`,
       };
     }
   }
 
   return {
     status: "warn",
-    message: "missing (run `npx paperclipai onboard`)",
+    message: input.missingMessage ?? "missing",
   };
 }
 
@@ -104,7 +117,24 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
   const uiUrl = opts.uiMode === "none" ? "disabled" : baseUrl;
   const configPath = resolvePaperclipConfigPath();
   const envFilePath = resolvePaperclipEnvPath();
-  const agentJwtSecret = resolveAgentJwtSecretStatus(envFilePath);
+  const agentJwtSecret = describeSecretStatus({
+    resolved: resolveAgentJwtSecretValue(),
+    envVarName: "PAPERCLIP_AGENT_JWT_SECRET",
+    envFilePath,
+    missingMessage: "missing (run `npx paperclipai onboard`)",
+  });
+  const betterAuthSecret = describeSecretStatus({
+    resolved: resolveBetterAuthSecret(),
+    envVarName: "BETTER_AUTH_SECRET",
+    envFilePath,
+    missingMessage: "missing (run `npx paperclipai onboard`)",
+  });
+  const toolActionSigningSecret = describeSecretStatus({
+    resolved: resolveFileBackedSecret("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"),
+    envVarName: "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET",
+    envFilePath,
+    missingMessage: "not configured (signed tool action approvals disabled)",
+  });
 
   const dbMode =
     opts.db.mode === "embedded-postgres"
@@ -157,16 +187,28 @@ export function printStartupBanner(opts: StartupBannerOptions): void {
     row("Database", dbDetails),
     row("Migrations", opts.migrationSummary),
     row(
+      "Better Auth",
+      betterAuthSecret.status === "pass"
+        ? color(betterAuthSecret.message, "green")
+        : color(betterAuthSecret.message, "yellow"),
+    ),
+    row(
       "Agent JWT",
       agentJwtSecret.status === "pass"
         ? color(agentJwtSecret.message, "green")
         : color(agentJwtSecret.message, "yellow"),
     ),
+    row(
+      "Tool Sign Secret",
+      toolActionSigningSecret.status === "pass"
+        ? color(toolActionSigningSecret.message, "green")
+        : color(toolActionSigningSecret.message, "yellow"),
+    ),
     row("Heartbeat", heartbeat),
     row("DB Backup", dbBackup),
     row("Backup Dir", opts.databaseBackupDir),
     row("Config", configPath),
-    agentJwtSecret.status === "warn"
+    agentJwtSecret.status === "warn" || betterAuthSecret.status === "warn"
       ? color("  ───────────────────────────────────────────────────────", "yellow")
       : null,
     color("  ───────────────────────────────────────────────────────", "blue"),

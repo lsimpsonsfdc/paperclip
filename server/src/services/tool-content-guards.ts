@@ -1,5 +1,6 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { redactEventPayload, redactSensitiveText, REDACTED_EVENT_VALUE } from "../redaction.js";
+import { resolveFileBackedSecret } from "../secrets/file-backed-secret.js";
 
 export class ToolContentValidationError extends Error {
   constructor(
@@ -19,7 +20,13 @@ const PROMPT_INJECTION_PATTERNS: Array<{ code: string; re: RegExp }> = [
 ];
 
 type ToolActionSigningSecretEnv = Partial<
-  Record<"PAPERCLIP_TOOL_ACTION_SIGNING_SECRET" | "PAPERCLIP_AGENT_JWT_SECRET" | "BETTER_AUTH_SECRET", string | undefined>
+  Record<
+    | "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET"
+    | "PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE"
+    | "PAPERCLIP_AGENT_JWT_SECRET"
+    | "BETTER_AUTH_SECRET",
+    string | undefined
+  >
 >;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -55,7 +62,7 @@ export class ToolActionSigningSecretMissingError extends Error {
 }
 
 export function resolveToolActionSigningSecret(env: ToolActionSigningSecretEnv = process.env as ToolActionSigningSecretEnv) {
-  const secret = env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET?.trim();
+  const secret = resolveFileBackedSecret("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", env).value;
   if (!secret) {
     throw new ToolActionSigningSecretMissingError();
   }

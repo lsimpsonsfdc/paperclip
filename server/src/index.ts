@@ -88,6 +88,7 @@ import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { ensureDecisionSigningSecret } from "./services/decision-signing.js";
+import { ensureRootOfTrustSecretFiles } from "./secrets/file-backed-secret.js";
 import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent } from "./services/decision-wakeup.js";
 import {
   coordinateHeartbeatSchedulerShutdown,
@@ -143,6 +144,10 @@ export async function startServer(): Promise<StartedServer> {
   // connection or the HTTP server exists — see instrumentation.ts.
   await instrumentationReady;
   ensureDecisionSigningSecret();
+  // Fail fast on a bad BETTER_AUTH_SECRET_FILE / PAPERCLIP_AGENT_JWT_SECRET_FILE /
+  // PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE before the server starts accepting
+  // traffic, rather than surfacing lazily on first auth/JWT/signing use.
+  ensureRootOfTrustSecretFiles();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {

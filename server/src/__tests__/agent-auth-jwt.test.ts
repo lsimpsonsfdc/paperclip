@@ -1,10 +1,16 @@
 import { createHmac } from "node:crypto";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createLocalAgentJwt, verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { createLocalAgentJwt, resolveAgentJwtSecretValue, verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { SecretFileError } from "../secrets/file-backed-secret.js";
 
 describe("agent local JWT", () => {
   const secretEnv = "PAPERCLIP_AGENT_JWT_SECRET";
+  const secretFileEnv = "PAPERCLIP_AGENT_JWT_SECRET_FILE";
   const betterAuthSecretEnv = "BETTER_AUTH_SECRET";
+  const betterAuthSecretFileEnv = "BETTER_AUTH_SECRET_FILE";
   const ttlEnv = "PAPERCLIP_AGENT_JWT_TTL_SECONDS";
   const issuerEnv = "PAPERCLIP_AGENT_JWT_ISSUER";
   const audienceEnv = "PAPERCLIP_AGENT_JWT_AUDIENCE";
@@ -13,7 +19,9 @@ describe("agent local JWT", () => {
 
   const originalEnv = {
     secret: process.env[secretEnv],
+    secretFile: process.env[secretFileEnv],
     betterAuthSecret: process.env[betterAuthSecretEnv],
+    betterAuthSecretFile: process.env[betterAuthSecretFileEnv],
     ttl: process.env[ttlEnv],
     issuer: process.env[issuerEnv],
     audience: process.env[audienceEnv],
@@ -21,9 +29,21 @@ describe("agent local JWT", () => {
     instanceId: process.env[instanceIdEnv],
   };
 
+  let tempDir: string | null = null;
+
+  function writeSecretFile(fileName: string, contents: string, mode = 0o600): string {
+    if (!tempDir) tempDir = mkdtempSync(join(tmpdir(), "paperclip-jwt-secret-test-"));
+    const filePath = join(tempDir, fileName);
+    writeFileSync(filePath, contents, { mode });
+    chmodSync(filePath, mode);
+    return filePath;
+  }
+
   beforeEach(() => {
     process.env[secretEnv] = "test-secret";
+    delete process.env[secretFileEnv];
     delete process.env[betterAuthSecretEnv];
+    delete process.env[betterAuthSecretFileEnv];
     process.env[ttlEnv] = "3600";
     delete process.env[issuerEnv];
     delete process.env[audienceEnv];
@@ -36,8 +56,12 @@ describe("agent local JWT", () => {
     vi.useRealTimers();
     if (originalEnv.secret === undefined) delete process.env[secretEnv];
     else process.env[secretEnv] = originalEnv.secret;
+    if (originalEnv.secretFile === undefined) delete process.env[secretFileEnv];
+    else process.env[secretFileEnv] = originalEnv.secretFile;
     if (originalEnv.betterAuthSecret === undefined) delete process.env[betterAuthSecretEnv];
     else process.env[betterAuthSecretEnv] = originalEnv.betterAuthSecret;
+    if (originalEnv.betterAuthSecretFile === undefined) delete process.env[betterAuthSecretFileEnv];
+    else process.env[betterAuthSecretFileEnv] = originalEnv.betterAuthSecretFile;
     if (originalEnv.ttl === undefined) delete process.env[ttlEnv];
     else process.env[ttlEnv] = originalEnv.ttl;
     if (originalEnv.issuer === undefined) delete process.env[issuerEnv];
@@ -48,6 +72,10 @@ describe("agent local JWT", () => {
     else process.env[disableLegacyFallbackEnv] = originalEnv.disableLegacyFallback;
     if (originalEnv.instanceId === undefined) delete process.env[instanceIdEnv];
     else process.env[instanceIdEnv] = originalEnv.instanceId;
+    if (tempDir) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = null;
+    }
   });
 
   it("creates and verifies a token", () => {
@@ -314,6 +342,60 @@ describe("agent local JWT", () => {
       company_id: "company-1",
       adapter_type: "claude_local",
       run_id: "run-1",
+    });
+  });
+
+  // --- PAPERCLIP_AGENT_JWT_SECRET_FILE --------------------------
+
+  describe("PAPERCLIP_AGENT_JWT_SECRET_FILE", () => {
+    it("is used when set, taking precedence over PAPERCLIP_AGENT_JWT_SECRET", () => {
+      const filePath = writeSecretFile("jwt-secret", "file-secret\n");
+      process.env[secretFileEnv] = filePath;
+      process.env[secretEnv] = "env-secret-should-be-ignored";
+
+      const resolved = resolveAgentJwtSecretValue();
+      expect(resolved).toEqual({ value: "file-secret", source: "file" });
+
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const token = createLocalAgentJwt("agent-1", "company-1", "claude_local", "run-1");
+      expect(verifyLocalAgentJwt(token!)?.sub).toBe("agent-1");
+
+      // Signed with the file secret, not the ignored env secret.
+      process.env[secretFileEnv] = "";
+      process.env[secretEnv] = "file-secret";
+      expect(verifyLocalAgentJwt(token!)?.sub).toBe("agent-1");
+    });
+
+    it("falls back to BETTER_AUTH_SECRET_FILE when PAPERCLIP_AGENT_JWT_SECRET_FILE is unset", () => {
+      const filePath = writeSecretFile("better-auth-secret", "auth-file-secret");
+      delete process.env[secretEnv];
+      process.env[betterAuthSecretFileEnv] = filePath;
+
+      const resolved = resolveAgentJwtSecretValue();
+      expect(resolved).toEqual({ value: "auth-file-secret", source: "file" });
+    });
+
+    it("fails loudly (does not silently fall back to the env var) when the file is unreadable", () => {
+      process.env[secretFileEnv] = join(tmpdir(), "paperclip-jwt-secret-test-does-not-exist", "missing.key");
+      process.env[secretEnv] = "env-secret-should-not-be-used";
+
+      expect(() => resolveAgentJwtSecretValue()).toThrow(SecretFileError);
+    });
+
+    it("rejects a secret file that is group/world-readable", () => {
+      const filePath = writeSecretFile("too-open", "file-secret", 0o644);
+      process.env[secretFileEnv] = filePath;
+
+      expect(() => resolveAgentJwtSecretValue()).toThrow(SecretFileError);
+      expect(() => resolveAgentJwtSecretValue()).toThrow(/readable by group or others/);
+    });
+
+    it("rejects an empty secret file rather than falling back", () => {
+      const filePath = writeSecretFile("empty", "");
+      process.env[secretFileEnv] = filePath;
+      process.env[secretEnv] = "env-secret-should-not-be-used";
+
+      expect(() => resolveAgentJwtSecretValue()).toThrow(SecretFileError);
     });
   });
 });

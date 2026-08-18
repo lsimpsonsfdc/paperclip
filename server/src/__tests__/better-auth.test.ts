@@ -1,3 +1,6 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { BetterAuthOptions } from "better-auth";
 import { getCookies } from "better-auth/cookies";
@@ -6,8 +9,10 @@ import {
   buildBetterAuthRateLimitOptions,
   deriveAuthCookiePrefix,
   deriveAuthTrustedOrigins,
+  resolveBetterAuthSecret,
   shouldDisableSecureAuthCookies,
 } from "../auth/better-auth.js";
+import { SecretFileError } from "../secrets/file-backed-secret.js";
 
 const ORIGINAL_INSTANCE_ID = process.env.PAPERCLIP_INSTANCE_ID;
 const ORIGINAL_PUBLIC_URL = process.env.PAPERCLIP_PUBLIC_URL;
@@ -17,6 +22,68 @@ afterEach(() => {
   else process.env.PAPERCLIP_INSTANCE_ID = ORIGINAL_INSTANCE_ID;
   if (ORIGINAL_PUBLIC_URL === undefined) delete process.env.PAPERCLIP_PUBLIC_URL;
   else process.env.PAPERCLIP_PUBLIC_URL = ORIGINAL_PUBLIC_URL;
+});
+
+describe("resolveBetterAuthSecret", () => {
+  let tempDir: string | null = null;
+
+  function writeSecretFile(fileName: string, contents: string, mode = 0o600): string {
+    if (!tempDir) tempDir = mkdtempSync(join(tmpdir(), "paperclip-better-auth-secret-test-"));
+    const filePath = join(tempDir, fileName);
+    writeFileSync(filePath, contents, { mode });
+    chmodSync(filePath, mode);
+    return filePath;
+  }
+
+  afterEach(() => {
+    if (tempDir) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = null;
+    }
+  });
+
+  it("prefers BETTER_AUTH_SECRET_FILE over the plain BETTER_AUTH_SECRET var", () => {
+    const filePath = writeSecretFile("better-auth-secret", "file-secret");
+    expect(
+      resolveBetterAuthSecret({
+        BETTER_AUTH_SECRET_FILE: filePath,
+        BETTER_AUTH_SECRET: "env-secret-should-be-ignored",
+      } as NodeJS.ProcessEnv),
+    ).toEqual({ value: "file-secret", source: "file" });
+  });
+
+  it("falls back to the plain BETTER_AUTH_SECRET var when no _FILE is set", () => {
+    expect(
+      resolveBetterAuthSecret({ BETTER_AUTH_SECRET: "env-secret" } as NodeJS.ProcessEnv),
+    ).toEqual({ value: "env-secret", source: "env" });
+  });
+
+  it("falls back to PAPERCLIP_AGENT_JWT_SECRET_FILE when BETTER_AUTH_SECRET is entirely unset", () => {
+    const filePath = writeSecretFile("agent-jwt-secret", "jwt-file-secret");
+    expect(
+      resolveBetterAuthSecret({ PAPERCLIP_AGENT_JWT_SECRET_FILE: filePath } as NodeJS.ProcessEnv),
+    ).toEqual({ value: "jwt-file-secret", source: "file" });
+  });
+
+  it("returns unset when nothing is configured", () => {
+    expect(resolveBetterAuthSecret({} as NodeJS.ProcessEnv)).toEqual({ value: undefined, source: "unset" });
+  });
+
+  it("fails loudly instead of silently falling back when BETTER_AUTH_SECRET_FILE is unreadable", () => {
+    expect(() =>
+      resolveBetterAuthSecret({
+        BETTER_AUTH_SECRET_FILE: join(tmpdir(), "paperclip-better-auth-secret-test-missing", "secret.key"),
+        BETTER_AUTH_SECRET: "env-secret-should-not-be-used",
+      } as NodeJS.ProcessEnv),
+    ).toThrow(SecretFileError);
+  });
+
+  it("rejects a BETTER_AUTH_SECRET_FILE that is group/world-readable", () => {
+    const filePath = writeSecretFile("too-open", "file-secret", 0o644);
+    expect(() =>
+      resolveBetterAuthSecret({ BETTER_AUTH_SECRET_FILE: filePath } as NodeJS.ProcessEnv),
+    ).toThrow(SecretFileError);
+  });
 });
 
 describe("Better Auth cookie scoping", () => {

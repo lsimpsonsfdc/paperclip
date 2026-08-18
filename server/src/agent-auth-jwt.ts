@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { normalizeAgentApiKeyScope, type AgentApiKeyScope } from "@paperclipai/shared";
 import { resolvePaperclipInstanceId } from "./home-paths.js";
+import { resolveFileBackedSecret, type ResolvedSecret } from "./secrets/file-backed-secret.js";
 
 interface JwtHeader {
   alg: string;
@@ -36,8 +37,21 @@ function parseBooleanEnv(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
+/**
+ * Resolve the agent JWT signing secret, preferring PAPERCLIP_AGENT_JWT_SECRET_FILE
+ * / PAPERCLIP_AGENT_JWT_SECRET over the BETTER_AUTH_SECRET_FILE / BETTER_AUTH_SECRET
+ * fallback. Exported so createBetterAuthInstance (auth/better-auth.ts) and the
+ * startup banner can report the same resolution and source without
+ * duplicating the precedence rules.
+ */
+export function resolveAgentJwtSecretValue(env: NodeJS.ProcessEnv = process.env): ResolvedSecret {
+  const primary = resolveFileBackedSecret("PAPERCLIP_AGENT_JWT_SECRET", env);
+  if (primary.value) return primary;
+  return resolveFileBackedSecret("BETTER_AUTH_SECRET", env);
+}
+
 function jwtConfig() {
-  const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim() || process.env.BETTER_AUTH_SECRET?.trim();
+  const secret = resolveAgentJwtSecretValue().value;
   if (!secret) return null;
 
   return {

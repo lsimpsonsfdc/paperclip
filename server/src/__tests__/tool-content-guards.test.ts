@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   canonicalToolArguments,
   readSignedToolArguments,
@@ -9,6 +12,7 @@ import {
   validateToolContent,
   verifyToolArgumentsSignature,
 } from "../services/tool-content-guards.js";
+import { SecretFileError } from "../secrets/file-backed-secret.js";
 
 describe("tool content guards", () => {
   const signingSecret = "test-tool-action-signing-secret";
@@ -58,6 +62,62 @@ describe("tool content guards", () => {
     expect(() =>
       resolveToolActionSigningSecret({}),
     ).toThrow("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET");
+  });
+
+  describe("PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE", () => {
+    let tempDir: string | null = null;
+
+    function writeSecretFile(fileName: string, contents: string, mode = 0o600): string {
+      if (!tempDir) tempDir = mkdtempSync(join(tmpdir(), "paperclip-tool-signing-secret-test-"));
+      const filePath = join(tempDir, fileName);
+      writeFileSync(filePath, contents, { mode });
+      chmodSync(filePath, mode);
+      return filePath;
+    }
+
+    afterEach(() => {
+      if (tempDir) {
+        rmSync(tempDir, { recursive: true, force: true });
+        tempDir = null;
+      }
+    });
+
+    it("is used when set, taking precedence over PAPERCLIP_TOOL_ACTION_SIGNING_SECRET", () => {
+      const filePath = writeSecretFile("tool-signing-secret", "file-secret");
+      expect(
+        resolveToolActionSigningSecret({
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE: filePath,
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "env-secret-should-be-ignored",
+        }),
+      ).toBe("file-secret");
+    });
+
+    it("fails loudly instead of silently falling back when the file is unreadable", () => {
+      expect(() =>
+        resolveToolActionSigningSecret({
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE: join(
+            tmpdir(),
+            "paperclip-tool-signing-secret-test-missing",
+            "secret.key",
+          ),
+          PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "env-secret-should-not-be-used",
+        }),
+      ).toThrow(SecretFileError);
+    });
+
+    it("rejects a secret file that is group/world-readable", () => {
+      const filePath = writeSecretFile("too-open", "file-secret", 0o644);
+      expect(() =>
+        resolveToolActionSigningSecret({ PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE: filePath }),
+      ).toThrow(SecretFileError);
+    });
+
+    it("rejects an empty secret file rather than falling back to ToolActionSigningSecretMissingError", () => {
+      const filePath = writeSecretFile("empty", "");
+      expect(() =>
+        resolveToolActionSigningSecret({ PAPERCLIP_TOOL_ACTION_SIGNING_SECRET_FILE: filePath }),
+      ).toThrow(SecretFileError);
+    });
   });
 
   it("redacts sensitive argument values before summarizing them", () => {
