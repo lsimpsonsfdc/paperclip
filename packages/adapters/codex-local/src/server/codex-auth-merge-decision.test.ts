@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -163,5 +163,47 @@ describe("codex-auth-merge-decision predicate seed mode", () => {
     });
     expect(defaultCode).toBe(KEEP_DESTINATION);
     expect(seedCode).toBe(USE_SOURCE);
+  });
+
+  it("never hands the decision predicate's spawned node process the root-of-trust signer secrets", async () => {
+    // decideCodexAuthMerge previously called execFile("node", args) with no
+    // `env` option, so Node inherited the full server process.env into the
+    // predicate subprocess. Swap in a script that reports which of the
+    // denylisted keys it can see, run it through the real decideCodexAuthMerge
+    // env-construction path, and assert none survive. See SSO-23089.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-secret-decision-"));
+    cleanupDirs.push(dir);
+    const envReportPath = path.join(dir, "env-report.json");
+    const envDumpScript = path.join(dir, "env-dump.cjs");
+    await writeFile(
+      envDumpScript,
+      "const fs = require('fs');\n" +
+        "const denylist = ['PAPERCLIP_AGENT_JWT_SECRET', 'PAPERCLIP_TOOL_ACTION_SIGNING_SECRET', 'BETTER_AUTH_SECRET'];\n" +
+        `fs.writeFileSync(${JSON.stringify(envReportPath)}, JSON.stringify(denylist.filter(k => k in process.env)));\n`,
+    );
+
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousToolActionSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    const previousBetterAuthSecret = process.env.BETTER_AUTH_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-jwt-signer-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "synthetic-tool-action-signer-value";
+    process.env.BETTER_AUTH_SECRET = "synthetic-better-auth-fallback-value";
+
+    try {
+      const { sanitizedDecisionScriptEnv } = await import("./codex-auth-merge-decision.js");
+      // decideCodexAuthMerge always targets the real .cjs predicate; exercise
+      // the exported env constructor it actually uses for the spawn directly,
+      // then prove that env is what a spawned script sees.
+      await execFile("node", [envDumpScript], { env: sanitizedDecisionScriptEnv() });
+      const reported = JSON.parse(await readFile(envReportPath, "utf8"));
+      expect(reported).toEqual([]);
+    } finally {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+      if (previousToolActionSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = previousToolActionSecret;
+      if (previousBetterAuthSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = previousBetterAuthSecret;
+    }
   });
 });

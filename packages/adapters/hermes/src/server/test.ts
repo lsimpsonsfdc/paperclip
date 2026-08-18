@@ -15,11 +15,18 @@ import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { promisify } from "node:util";
 
+import { sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";
+
 import { HERMES_CLI, DEFAULT_MODEL, ADAPTER_TYPE, VALID_PROVIDERS } from "../shared/constants.js";
 import { detectModel, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 import { resolveHermesCommand } from "./execute.js";
 
 const execFileAsync = promisify(execFile);
+
+// Omitting `env` here would make Node inherit the full server process.env,
+// root-of-trust signer secrets included, into these `--version` probes. See
+// SSO-23089.
+const PROBE_ENV = sanitizeInheritedPaperclipEnv(process.env);
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
@@ -34,7 +41,7 @@ async function checkCliInstalled(
 ): Promise<AdapterEnvironmentCheck | null> {
   try {
     // Try to run the command to see if it exists
-    await execFileAsync(command, ["--version"], { timeout: 10_000 });
+    await execFileAsync(command, ["--version"], { timeout: 10_000, env: PROBE_ENV });
     return null; // OK — it ran successfully
   } catch (err: unknown) {
     const e = err as NodeJS.ErrnoException;
@@ -58,6 +65,7 @@ async function checkCliVersion(
   try {
     const { stdout } = await execFileAsync(command, ["--version"], {
       timeout: 10_000,
+      env: PROBE_ENV,
     });
     const version = stdout.trim();
     if (version) {
@@ -87,6 +95,7 @@ async function checkPython(): Promise<AdapterEnvironmentCheck | null> {
   try {
     const { stdout } = await execFileAsync("python3", ["--version"], {
       timeout: 5_000,
+      env: PROBE_ENV,
     });
     const version = stdout.trim();
     const match = version.match(/(\d+)\.(\d+)/);

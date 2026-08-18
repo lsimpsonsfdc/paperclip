@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "@paperclipai/adapter-utils/server-utils";
 
 const execFileAsync = promisify(execFile);
 
@@ -21,10 +22,19 @@ function hasNonEmptyProcessEnv(key: string): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+function withoutRootOfTrustEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") continue;
+    if ((ROOT_OF_TRUST_ENV_DENYLIST as readonly string[]).includes(key)) continue;
+    filtered[key] = value;
+  }
+  return filtered;
+}
+
 function createClaudeQuotaEnv(): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value !== "string") continue;
+  for (const [key, value] of Object.entries(withoutRootOfTrustEnv(process.env))) {
     if (key.startsWith("ANTHROPIC_")) continue;
     env[key] = value;
   }
@@ -115,7 +125,7 @@ interface ClaudeAuthStatus {
 export async function readClaudeAuthStatus(): Promise<ClaudeAuthStatus | null> {
   try {
     const { stdout } = await execFileAsync("claude", ["auth", "status"], {
-      env: process.env,
+      env: withoutRootOfTrustEnv(process.env),
       timeout: 5_000,
       maxBuffer: 1024 * 1024,
     });

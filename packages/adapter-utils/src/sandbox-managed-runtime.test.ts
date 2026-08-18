@@ -11,10 +11,12 @@ import {
   assertSyncOperationsConfined,
   mirrorDirectory,
   prepareSandboxManagedRuntime,
+  tarSpawnEnv,
   type SandboxManagedRuntimeClient,
   type SandboxSyncOperation,
   type SandboxSyncResult,
 } from "./sandbox-managed-runtime.js";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "./remote-execution-env.js";
 import {
   prepareCommandManagedRuntime,
   type CommandManagedRuntimeRunner,
@@ -2129,6 +2131,35 @@ describe("sandbox managed runtime", () => {
       expect(span, name).toBeDefined();
       expect(span!.ended).toBe(true);
       expect(span!.parentName).toBe("stage.sync");
+    }
+  });
+});
+
+describe("tarSpawnEnv", () => {
+  it("strips root-of-trust signer secrets from the env used for local tar invocations", () => {
+    // execTar previously spread the full process.env directly, so the local
+    // `tar` process spawned to package a workspace for sandbox sync inherited
+    // the server's root-of-trust signer secrets. See SSO-23089.
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousToolActionSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    const previousBetterAuthSecret = process.env.BETTER_AUTH_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-jwt-signer-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "synthetic-tool-action-signer-value";
+    process.env.BETTER_AUTH_SECRET = "synthetic-better-auth-fallback-value";
+
+    try {
+      const env = tarSpawnEnv();
+      for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+        expect(env).not.toHaveProperty(key);
+      }
+      expect(env.COPYFILE_DISABLE).toBe("1");
+    } finally {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+      if (previousToolActionSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = previousToolActionSecret;
+      if (previousBetterAuthSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = previousBetterAuthSecret;
     }
   });
 });

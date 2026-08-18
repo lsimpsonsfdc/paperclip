@@ -78,6 +78,33 @@ describe("CodexRpcClient spawn failures", () => {
     expect(result.error).toContain("Codex app-server");
   });
 
+  it("never hands the spawned codex app-server the root-of-trust signer secrets", async () => {
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousToolActionSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    const previousBetterAuthSecret = process.env.BETTER_AUTH_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-jwt-signer-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "synthetic-tool-action-signer-value";
+    process.env.BETTER_AUTH_SECRET = "synthetic-better-auth-fallback-value";
+    try {
+      mockSpawn.mockImplementation(() => createChildThatErrorsOnMicrotask(new Error("spawn codex ENOENT")));
+
+      await getQuotaWindows();
+
+      expect(mockSpawn).toHaveBeenCalled();
+      const spawnedEnv = mockSpawn.mock.calls[0][2].env as Record<string, string>;
+      expect(spawnedEnv.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(spawnedEnv.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      expect(spawnedEnv.BETTER_AUTH_SECRET).toBeUndefined();
+    } finally {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+      if (previousToolActionSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = previousToolActionSecret;
+      if (previousBetterAuthSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = previousBetterAuthSecret;
+    }
+  });
+
   it("falls back to WHAM after an app-server refresh-token failure", async () => {
     fs.writeFileSync(
       path.join(isolatedCodexHome!, "auth.json"),

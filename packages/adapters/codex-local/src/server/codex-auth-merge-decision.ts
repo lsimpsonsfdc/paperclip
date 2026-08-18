@@ -1,8 +1,19 @@
 import { execFile as execFileCallback } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "@paperclipai/adapter-utils/server-utils";
 
 const execFile = promisify(execFileCallback);
+
+// Omitting `env` here would make Node inherit the full server process.env,
+// root-of-trust signer secrets included. See SSO-23089.
+export function sanitizedDecisionScriptEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+    delete env[key];
+  }
+  return env;
+}
 
 // The single identity-and-freshness predicate. Every credential writer that must
 // answer "should the caller replace `destination` with `source`?" runs this one
@@ -49,7 +60,7 @@ export async function decideCodexAuthMerge(
     ? [DECISION_SCRIPT_PATH, SEED_IF_DEST_ABSENT_FLAG, sourcePath, destinationPath]
     : [DECISION_SCRIPT_PATH, sourcePath, destinationPath];
   try {
-    await execFile("node", args);
+    await execFile("node", args, { env: sanitizedDecisionScriptEnv() });
   } catch (error) {
     const code = (error as { code?: unknown }).code;
     if (code === USE_SOURCE_EXIT || code === KEEP_DESTINATION_EXIT) {

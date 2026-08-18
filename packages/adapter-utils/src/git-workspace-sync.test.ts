@@ -16,9 +16,11 @@ import {
   readGitWorkspaceSnapshot,
   runLocalGit,
   sanitizeGitRemoteUrl,
+  sanitizedLocalGitEnv,
   setExpensiveWorkspaceGitExecutor,
   withShallowGitWorkspaceClone,
 } from "./git-workspace-sync.js";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "./remote-execution-env.js";
 
 const execFile = promisify(execFileCallback);
 
@@ -577,5 +579,33 @@ describe("sanitizeGitRemoteUrl", () => {
   it("returns null for empty input", () => {
     expect(sanitizeGitRemoteUrl("")).toBeNull();
     expect(sanitizeGitRemoteUrl("   ")).toBeNull();
+  });
+});
+
+describe("sanitizedLocalGitEnv", () => {
+  it("strips root-of-trust signer secrets from the env used for local git invocations", () => {
+    // runLocalGit previously omitted `env` entirely, so Node inherited the full
+    // server process.env, root-of-trust signer secrets included, into every
+    // local `git` call. See SSO-23089.
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousToolActionSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    const previousBetterAuthSecret = process.env.BETTER_AUTH_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-jwt-signer-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "synthetic-tool-action-signer-value";
+    process.env.BETTER_AUTH_SECRET = "synthetic-better-auth-fallback-value";
+
+    try {
+      const env = sanitizedLocalGitEnv();
+      for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+        expect(env).not.toHaveProperty(key);
+      }
+    } finally {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+      if (previousToolActionSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = previousToolActionSecret;
+      if (previousBetterAuthSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = previousBetterAuthSecret;
+    }
   });
 });

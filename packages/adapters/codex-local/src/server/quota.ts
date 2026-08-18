@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "@paperclipai/adapter-utils/server-utils";
 import {
   classifyCodexAuthRefreshFailure,
   type CodexAuthRefreshFailureClass,
@@ -16,6 +17,16 @@ export function codexHomeDir(): string {
   const fromEnv = process.env.CODEX_HOME;
   if (typeof fromEnv === "string" && fromEnv.trim().length > 0) return fromEnv.trim();
   return path.join(os.homedir(), ".codex");
+}
+
+function createCodexQuotaEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value !== "string") continue;
+    if ((ROOT_OF_TRUST_ENV_DENYLIST as readonly string[]).includes(key)) continue;
+    env[key] = value;
+  }
+  return env;
 }
 
 interface CodexLegacyAuthFile {
@@ -471,7 +482,7 @@ class CodexRpcClient {
   private proc = spawn(
     "codex",
     ["-s", "read-only", "-a", "untrusted", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
+    { stdio: ["pipe", "pipe", "pipe"], env: createCodexQuotaEnv() },
   );
 
   private nextId = 1;

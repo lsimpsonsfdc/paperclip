@@ -17,6 +17,7 @@ import {
   resetLocalGitIndexToHead,
   withShallowGitWorkspaceClone,
 } from "./git-workspace-sync.js";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "./remote-execution-env.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
 import {
   createRuntimeProgressReporter,
@@ -444,12 +445,17 @@ async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): 
   }
 }
 
+export function tarSpawnEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, COPYFILE_DISABLE: "1" };
+  for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+    delete env[key];
+  }
+  return env;
+}
+
 async function execTar(args: string[]): Promise<void> {
   await execFile("tar", args, {
-    env: {
-      ...process.env,
-      COPYFILE_DISABLE: "1",
-    },
+    env: tarSpawnEnv(),
     maxBuffer: 32 * 1024 * 1024,
   });
 }

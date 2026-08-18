@@ -204,4 +204,38 @@ describe("hermes-local adapter onSpawn forwarding", () => {
       else process.env.PAPERCLIP_API_KEY = previousApiKey;
     }
   });
+
+  // SSO-23089: execute.ts used to build its run env with a raw `...process.env`
+  // spread, which copied the server's root-of-trust signer secrets in as literal
+  // own-properties of the object passed as `opts.env`. runChildProcess merges its
+  // own sanitized base env with `opts.env` LAST, so a caller-supplied env that
+  // already carries these keys silently re-introduces them into the spawned
+  // hermes process — sanitizing only inside runChildProcess is not enough.
+  it("never hands the spawned hermes process the root-of-trust signer secrets", async () => {
+    const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
+    const previousToolActionSecret = process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+    const previousBetterAuthSecret = process.env.BETTER_AUTH_SECRET;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "synthetic-jwt-signer-value";
+    process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = "synthetic-tool-action-signer-value";
+    process.env.BETTER_AUTH_SECRET = "synthetic-better-auth-fallback-value";
+
+    try {
+      const { ctx } = makeCtx();
+      await execute(ctx as any);
+
+      const mocked = vi.mocked(serverUtils.runChildProcess);
+      const lastCall = mocked.mock.calls[mocked.mock.calls.length - 1];
+      const opts = lastCall[3] as { env: Record<string, string> };
+      expect(opts.env.PAPERCLIP_AGENT_JWT_SECRET).toBeUndefined();
+      expect(opts.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET).toBeUndefined();
+      expect(opts.env.BETTER_AUTH_SECRET).toBeUndefined();
+    } finally {
+      if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET;
+      else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
+      if (previousToolActionSecret === undefined) delete process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET;
+      else process.env.PAPERCLIP_TOOL_ACTION_SIGNING_SECRET = previousToolActionSecret;
+      if (previousBetterAuthSecret === undefined) delete process.env.BETTER_AUTH_SECRET;
+      else process.env.BETTER_AUTH_SECRET = previousBetterAuthSecret;
+    }
+  });
 });

@@ -38,6 +38,7 @@ import {
   selectPaperclipTaskMarkdown,
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
+  sanitizeInheritedPaperclipEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 
 import {
@@ -462,9 +463,15 @@ export async function execute(
   }
 
   // ── Build environment ──────────────────────────────────────────────────
+  // sanitizeInheritedPaperclipEnv (not a raw process.env spread) so root-of-
+  // trust signer secrets never become literal own-properties of `env` here.
+  // runChildProcess re-derives its own sanitized base from process.env, but
+  // its merge puts the caller's `opts.env` LAST — so if this object already
+  // carried the secrets as plain keys, that later merge would win and
+  // silently re-introduce them into the spawned hermes process. See SSO-23089.
   const userEnv = config.env as Record<string, string> | undefined;
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
+    ...(sanitizeInheritedPaperclipEnv(process.env) as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
   };

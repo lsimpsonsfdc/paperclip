@@ -11,6 +11,7 @@ import {
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
   readSanitizedOriginRemoteUrl,
 } from "./git-workspace-sync.js";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "./remote-execution-env.js";
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
@@ -189,6 +190,21 @@ export function parseSshRemoteExecutionSpec(value: unknown): SshRemoteExecutionS
   };
 }
 
+// This module spawns local helper binaries (git, tar, ssh, ssh-keygen, ps,
+// sh) directly with node:child_process rather than through
+// runChildProcess/sanitizeInheritedPaperclipEnv, and several call sites
+// previously omitted `env` entirely — which makes Node inherit the full
+// server process.env, root-of-trust signer secrets included. Every local
+// spawn/execFile in this file must pass an explicitly sanitized env. See
+// SSO-23089.
+export function sanitizedLocalSpawnEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+    delete env[key];
+  }
+  return env;
+}
+
 async function execFileText(
   file: string,
   args: string[],
@@ -204,6 +220,7 @@ async function execFileText(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
+        env: sanitizedLocalSpawnEnv(),
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -231,6 +248,7 @@ async function spawnText(
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+      env: sanitizedLocalSpawnEnv(),
     });
 
     const maxBuffer = options.maxBuffer ?? 1024 * 128;
@@ -414,11 +432,10 @@ function tarExcludeArgs(exclude: string[] | undefined): string[] {
 }
 
 function tarSpawnEnv(): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
+  return sanitizedLocalSpawnEnv({
     // Prevent macOS bsdtar from emitting AppleDouble metadata files like ._README.md.
     COPYFILE_DISABLE: "1",
-  };
+  });
 }
 
 // Converts a tar `--exclude` pattern into a regexp for the local-size estimate.
@@ -666,6 +683,7 @@ async function streamLocalFileToSsh(input: {
     const source = createReadStream(input.localFile);
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
+      env: sanitizedLocalSpawnEnv(),
     });
 
     let sshStderr = "";
@@ -720,6 +738,7 @@ async function streamSshToLocalFile(input: {
   await new Promise<void>((resolve, reject) => {
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["ignore", "pipe", "pipe"],
+      env: sanitizedLocalSpawnEnv(),
     });
     const sink = createWriteStream(input.localFile, { mode: 0o600 });
 
@@ -1367,6 +1386,7 @@ export async function syncDirectoryToSsh(input: {
     });
     const ssh = spawn("ssh", sshArgs, {
       stdio: ["pipe", "ignore", "pipe"],
+      env: sanitizedLocalSpawnEnv(),
     });
 
     let tarStderr = "";
@@ -1478,6 +1498,7 @@ export async function syncDirectoryFromSsh(input: {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
+        env: sanitizedLocalSpawnEnv(),
       });
       const tar = spawn("tar", ["-xf", "-", "-C", stagingDir], {
         stdio: ["pipe", "ignore", "pipe"],
@@ -1818,6 +1839,7 @@ export async function startSshEnvLabFixture(input: {
   const child = spawn(sshdPath, ["-D", "-f", sshdConfigPath, "-E", sshdLogPath], {
     detached: true,
     stdio: "ignore",
+    env: sanitizedLocalSpawnEnv(),
   });
   child.unref();
 

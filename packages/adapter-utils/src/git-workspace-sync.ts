@@ -3,6 +3,18 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ROOT_OF_TRUST_ENV_DENYLIST } from "./remote-execution-env.js";
+
+// Omitting `env` here would make Node inherit the full server process.env,
+// root-of-trust signer secrets included, into every local `git` invocation.
+// See SSO-23089.
+export function sanitizedLocalGitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+    delete env[key];
+  }
+  return env;
+}
 
 export interface GitCommandResult {
   stdout: string;
@@ -78,6 +90,7 @@ export async function runLocalGit(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
+        env: sanitizedLocalGitEnv(),
       },
       (error, stdout, stderr) => {
         if (error) {

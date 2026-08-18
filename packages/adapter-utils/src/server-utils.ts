@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { ROOT_OF_TRUST_ENV_DENYLIST, sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -2335,9 +2335,18 @@ export function refreshPaperclipWorkspaceEnvForExecution(input: {
   return shapedWorkspaceEnv;
 }
 
+// Re-exported so existing `@paperclipai/adapter-utils/server-utils` imports
+// (e.g. the claude-local/codex-local quota env filters) keep working. The
+// canonical definition lives in remote-execution-env.ts — see the comment
+// there for why.
+export { ROOT_OF_TRUST_ENV_DENYLIST };
+
 export function sanitizeInheritedPaperclipEnv(baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.PAPERCLIPAI_CMD;
+  for (const key of ROOT_OF_TRUST_ENV_DENYLIST) {
+    delete env[key];
+  }
   for (const key of Object.keys(env)) {
     if (!key.startsWith("PAPERCLIP_")) continue;
     if (key === "PAPERCLIP_RUNTIME_API_URL") continue;
