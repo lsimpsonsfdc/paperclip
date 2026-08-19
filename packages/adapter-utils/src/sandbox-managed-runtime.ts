@@ -27,6 +27,7 @@ import {
   type RuntimeStatusSink,
 } from "./runtime-progress.js";
 import { isRelativePathOrDescendant, shouldExcludePath } from "./exclude-patterns.js";
+import { buildInheritedAgentEnv } from "./server-utils.js";
 import type { RuntimeSpanRunner } from "./acpx-engine/startup-timing.js";
 
 const execFile = promisify(execFileCallback);
@@ -446,10 +447,7 @@ async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): 
 
 async function execTar(args: string[]): Promise<void> {
   await execFile("tar", args, {
-    env: {
-      ...process.env,
-      COPYFILE_DISABLE: "1",
-    },
+    env: buildInheritedAgentEnv({ COPYFILE_DISABLE: "1" }),
     maxBuffer: 32 * 1024 * 1024,
   });
 }

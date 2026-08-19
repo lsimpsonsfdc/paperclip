@@ -39,7 +39,8 @@ import {
   buildInvocationEnvForLogs,
   buildPaperclipEnv,
   ensureAbsoluteDirectory,
-  ensurePathInEnv,
+  buildInheritedAgentEnv,
+  buildInheritedAgentEnvRecord,
   ensurePaperclipSkillSymlink,
   isForbiddenConfigEnvKey,
   isPaperclipRuntimeEnvKey,
@@ -1797,7 +1798,7 @@ async function buildRuntime(input: {
   if (acpxAgent === "gemini" && agentCommandShell) {
     const normalized = await normalizeGeminiAcpCommandShell(
       agentCommandShell,
-      ensurePathInEnv({ ...process.env, ...env }),
+      buildInheritedAgentEnv(env, { ensurePath: true }),
     );
     if (normalized !== agentCommandShell) {
       agentCommandShell = normalized;
@@ -2267,11 +2268,7 @@ async function applySessionConfigOptions(input: {
  * local / runner-less lane so both resolve the runtime env identically.
  */
 function resolveRuntimeEnv(env: Record<string, string>): Record<string, string> {
-  return Object.fromEntries(
-    Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
-      (entry): entry is [string, string] => typeof entry[1] === "string",
-    ),
-  );
+  return buildInheritedAgentEnvRecord(env, { ensurePath: true });
 }
 
 // Stop both host-side bridges in one `allSettled`. This is the settlement

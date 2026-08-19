@@ -36,9 +36,49 @@ function parseBooleanEnv(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
 }
 
+/**
+ * Raised when a deployment relies on the removed BETTER_AUTH_SECRET fallback.
+ *
+ * Signing agent run JWTs with the better-auth web-session key shares one key
+ * between two different trust domains (human operator sessions and agent run
+ * identity). That is a separation-of-duties defect, and failing closed at boot
+ * is the correct failure mode: silently sharing the key hides the problem, and
+ * an operator who never set PAPERCLIP_AGENT_JWT_SECRET has no signal that agent
+ * tokens are signed with their session key. See SSO-22654.
+ */
+export class AgentJwtSecretFallbackError extends Error {
+  constructor() {
+    super(
+      "PAPERCLIP_AGENT_JWT_SECRET is not set, but BETTER_AUTH_SECRET is. Paperclip no longer signs agent " +
+        "run JWTs with BETTER_AUTH_SECRET: that shared the human web-session signing key with the agent-JWT " +
+        "signer. Fix: generate a dedicated secret (`openssl rand -hex 32`) and set PAPERCLIP_AGENT_JWT_SECRET " +
+        "in this instance's environment (worktrees inherit it from .paperclip/.env), then restart. Leave " +
+        "BETTER_AUTH_SECRET in place — it still signs web sessions.",
+    );
+    this.name = "AgentJwtSecretFallbackError";
+  }
+}
+
+/**
+ * Boot-time guard for the removed fallback. Called from startServer() so a
+ * misconfigured deployment fails at startup with an actionable message instead
+ * of at the first agent dispatch.
+ *
+ * Deployments with neither var set are unchanged: agent-JWT minting stays
+ * disabled (the API-key path still works), exactly as before.
+ */
+export function assertAgentJwtSecretConfigured(env: NodeJS.ProcessEnv = process.env): void {
+  if (env.PAPERCLIP_AGENT_JWT_SECRET?.trim()) return;
+  if (env.BETTER_AUTH_SECRET?.trim()) throw new AgentJwtSecretFallbackError();
+}
+
 function jwtConfig() {
-  const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim() || process.env.BETTER_AUTH_SECRET?.trim();
-  if (!secret) return null;
+  const secret = process.env.PAPERCLIP_AGENT_JWT_SECRET?.trim();
+  if (!secret) {
+    // Fail loud rather than silently reusing the web-session signer.
+    assertAgentJwtSecretConfigured();
+    return null;
+  }
 
   return {
     secret,

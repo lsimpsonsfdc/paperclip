@@ -325,6 +325,10 @@ const server = net.createServer((client) => {
   upstream.on("error", close);
 });
 server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
+  // Deliberately a bare inherit (SSO-22654): this bridge is itself the sandbox
+  // entrypoint, spawned by runChildProcess() with an env already built by
+  // buildInheritedAgentEnv(). Re-filtering here would only re-check a
+  // pre-cleaned env, and this source cannot import adapter-utils.
   const child = spawn(executable, args, { stdio: "inherit", env: process.env });
   const forward = (signal) => { if (!child.killed) child.kill(signal); };
   process.on("SIGTERM", () => forward("SIGTERM"));
