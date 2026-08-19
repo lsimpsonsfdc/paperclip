@@ -36,7 +36,7 @@ import { and, desc, eq, gte, inArray, isNull, lte, ne, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { conflict } from "../errors.js";
 import { resolveHomeAwarePath } from "../home-paths.js";
-import { hasVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
+import { hasVerifiedWorktreeSeedManifest, isVerifiedWorktreeSeedManifest } from "../worktree-seed-manifest.js";
 import {
   buildManagedWorkspaceGuestEnv,
   logManagedWorkspaceReadinessRejection,
@@ -2871,7 +2871,7 @@ async function recordGitOperation(
 async function recordWorkspaceCommandOperation(
   recorder: WorkspaceOperationRecorder | null | undefined,
   input: {
-    phase: "workspace_provision" | "workspace_runtime_provision" | "workspace_teardown";
+    phase: "workspace_provision" | "workspace_seed" | "workspace_runtime_provision" | "workspace_teardown";
     command: string;
     resolvedCommand?: string;
     cwd: string;
@@ -2903,26 +2903,31 @@ async function recordWorkspaceCommandOperation(
         cwd: input.cwd,
         env: input.env,
       });
+      const seedEvidence = input.phase === "workspace_seed"
+        ? readWorkspaceSeedOperationEvidence(input.cwd)
+        : null;
       stdout = result.stdout;
-      stderr = result.stderr;
-      code = result.code;
+      stderr = [result.stderr, seedEvidence?.error].filter(Boolean).join("\n");
+      code = result.code === 0 && seedEvidence && !seedEvidence.verified ? 1 : result.code;
       if (result.stdout && input.onLog) await input.onLog("stdout", `[runtime-provision] ${result.stdout}`);
-      if (result.stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${result.stderr}`);
+      if (stderr && input.onLog) await input.onLog("stderr", `[runtime-provision] ${stderr}`);
+      const truncationMetadata = result.stdoutTruncated || result.stderrTruncated
+        ? {
+            stdoutTruncated: result.stdoutTruncated,
+            stderrTruncated: result.stderrTruncated,
+            stdoutBytes: result.stdoutBytes,
+            stderrBytes: result.stderrBytes,
+          }
+        : null;
       return {
-        status: result.code === 0 ? "succeeded" : "failed",
-        exitCode: result.code,
+        status: code === 0 ? "succeeded" : "failed",
+        exitCode: code,
         stdout: result.stdout,
-        stderr: result.stderr,
-        system: result.code === 0 ? input.successMessage ?? null : null,
-        metadata:
-          result.stdoutTruncated || result.stderrTruncated
-            ? {
-                stdoutTruncated: result.stdoutTruncated,
-                stderrTruncated: result.stderrTruncated,
-                stdoutBytes: result.stdoutBytes,
-                stderrBytes: result.stderrBytes,
-              }
-            : null,
+        stderr,
+        system: code === 0 ? input.successMessage ?? null : null,
+        metadata: seedEvidence
+          ? { ...seedEvidence.metadata, ...(truncationMetadata ?? {}) }
+          : truncationMetadata,
       };
     },
   });
@@ -5052,6 +5057,7 @@ type StartLocalRuntimeServiceInput = {
   service: Record<string, unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   runtimeProvisionCommand?: string | null;
+  runtimeProvisionKind?: RuntimeProvisionKind | null;
   recorder?: WorkspaceOperationRecorder | null;
   provisionCoordinator?: RuntimeProvisionCoordinator;
   preparedProvisioningRecord?: RuntimeServiceRecord | null;
@@ -5077,6 +5083,49 @@ function readRuntimeProvisionCommand(config: Record<string, unknown>) {
     config.runtimeProvisionCommand,
     asString(workspaceStrategy.runtimeProvisionCommand, ""),
   ).trim();
+}
+
+const BUILTIN_WORKSPACE_SEED_COMMAND = "bash ./scripts/provision-worktree-runtime.sh";
+
+type RuntimeProvisionKind = "workspace_seed" | "runtime_dependencies";
+
+function readWorkspaceSeedOperationEvidence(worktreePath: string): {
+  verified: boolean;
+  error: string | null;
+  metadata: Record<string, unknown>;
+} {
+  const manifestPath = path.join(worktreePath, ".paperclip", "seed-manifest.json");
+  try {
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+    const state = typeof manifest.state === "string" ? manifest.state : "unknown";
+    const phase = typeof manifest.phase === "string" ? manifest.phase : null;
+    const verified = isVerifiedWorktreeSeedManifest(manifest);
+    return {
+      verified,
+      error: verified
+        ? null
+        : phase
+          ? `Workspace seed command returned without a verified manifest (state: ${state}, phase: ${phase}).`
+          : `Workspace seed command returned without a verified manifest (state: ${state}).`,
+      metadata: {
+        provisionKind: "workspace_seed",
+        seedState: state,
+        seedPhase: phase,
+        seedFailurePhase: state === "failed" ? phase : null,
+      },
+    };
+  } catch {
+    return {
+      verified: false,
+      error: "Workspace seed command returned without a readable seed manifest.",
+      metadata: {
+        provisionKind: "workspace_seed",
+        seedState: existsSync(manifestPath) ? "unreadable" : "absent",
+        seedPhase: null,
+        seedFailurePhase: "seed_manifest_unreadable",
+      },
+    };
+  }
 }
 
 export function resolveRuntimeProvisionCommand(input: {
@@ -5105,7 +5154,21 @@ export function resolveRuntimeProvisionCommand(input: {
     return "";
   }
 
-  return "bash ./scripts/provision-worktree-runtime.sh";
+  return BUILTIN_WORKSPACE_SEED_COMMAND;
+}
+
+function resolveRuntimeProvision(input: {
+  config: Record<string, unknown>;
+  workspace: RealizedExecutionWorkspace;
+}): { command: string; kind: RuntimeProvisionKind | null } {
+  const command = resolveRuntimeProvisionCommand(input);
+  if (!command) return { command, kind: null };
+  return {
+    command,
+    kind: readRuntimeProvisionCommand(input.config)
+      ? "runtime_dependencies"
+      : "workspace_seed",
+  };
 }
 
 function runtimeProvisionWorkspaceKey(input: StartLocalRuntimeServiceInput) {
@@ -5136,8 +5199,9 @@ async function runRuntimeProvisionWithWorkspaceMutex(input: StartLocalRuntimeSer
       })
     : null);
   const resolvedCommand = resolveRepoManagedWorkspaceCommand(command, input.workspace.baseCwd);
+  const workspaceSeed = input.runtimeProvisionKind === "workspace_seed";
   const promise = recordWorkspaceCommandOperation(recorder, {
-    phase: "workspace_runtime_provision",
+    phase: workspaceSeed ? "workspace_seed" : "workspace_runtime_provision",
     command,
     resolvedCommand,
     cwd: input.workspace.cwd,
@@ -5150,14 +5214,19 @@ async function runRuntimeProvisionWithWorkspaceMutex(input: StartLocalRuntimeSer
       agent: input.agent,
       created: input.workspace.created,
     }),
-    label: `Runtime provision command "${command}"`,
+    label: workspaceSeed
+      ? `Workspace seed command "${command}"`
+      : `Runtime provision command "${command}"`,
     metadata: {
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       projectWorkspaceId: input.workspace.workspaceId,
       serviceName: asString(input.service.name, "service"),
+      provisionKind: workspaceSeed ? "workspace_seed" : "runtime_dependencies",
       resolvedCommand: resolvedCommand === command ? null : resolvedCommand,
     },
-    successMessage: `Provisioned runtime dependencies for ${input.workspace.cwd}\n`,
+    successMessage: workspaceSeed
+      ? `Verified the workspace database seed for ${input.workspace.cwd}\n`
+      : `Provisioned runtime dependencies for ${input.workspace.cwd}\n`,
     onLog: input.onLog,
   }).then(() => undefined);
 
@@ -6465,7 +6534,8 @@ async function ensureRuntimeServicesForRunInvocation(
   });
   const acquiredServiceIds: string[] = [];
   const refs: RuntimeServiceRef[] = [];
-  const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
+  const runtimeProvision = resolveRuntimeProvision(input);
+  const runtimeProvisionCommand = runtimeProvision.command;
   const provisionCoordinator = createRuntimeProvisionCoordinator();
   const allowFixedPortFallback = await isPersistedIsolatedExecutionWorkspace({
     db: input.db,
@@ -6523,6 +6593,7 @@ async function ensureRuntimeServicesForRunInvocation(
         service,
         onLog: input.onLog,
         runtimeProvisionCommand,
+        runtimeProvisionKind: runtimeProvision.kind,
         recorder: input.recorder,
         provisionCoordinator,
         allowFixedPortFallback,
@@ -6693,6 +6764,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
     deferReadiness?: boolean;
     allowFixedPortFallback?: boolean;
     runtimeProvisionCommand?: string;
+    runtimeProvisionKind?: RuntimeProvisionKind | null;
     provisionCoordinator?: RuntimeProvisionCoordinator;
     preparedProvisioning?: {
       service: Record<string, unknown>;
@@ -6759,6 +6831,7 @@ async function startRuntimeServicesForWorkspaceControlUnlocked(
       service,
       onLog: input.onLog,
       runtimeProvisionCommand: options?.runtimeProvisionCommand,
+      runtimeProvisionKind: options?.runtimeProvisionKind,
       recorder: input.recorder,
       provisionCoordinator: options?.provisionCoordinator,
       preparedProvisioningRecord:
@@ -6861,7 +6934,8 @@ async function startRuntimeServicesForWorkspaceControlInvocation(
     serviceStates: readConfiguredServiceStates(input.config),
   });
   const invocationId = input.invocationId ?? randomUUID();
-  const runtimeProvisionCommand = resolveRuntimeProvisionCommand(input);
+  const runtimeProvision = resolveRuntimeProvision(input);
+  const runtimeProvisionCommand = runtimeProvision.command;
   const provisionCoordinator = createRuntimeProvisionCoordinator();
   const hasHttpsExposure = await anyRuntimeServiceUsesHttpsExposure(rawServices);
 
@@ -6880,7 +6954,11 @@ async function startRuntimeServicesForWorkspaceControlInvocation(
       invocationId,
       input.db,
       input.db,
-      { runtimeProvisionCommand, provisionCoordinator },
+      {
+        runtimeProvisionCommand,
+        runtimeProvisionKind: runtimeProvision.kind,
+        provisionCoordinator,
+      },
     );
     return batch.refs;
   }
@@ -6931,6 +7009,7 @@ async function startRuntimeServicesForWorkspaceControlInvocation(
           service,
           onLog: input.onLog,
           runtimeProvisionCommand,
+          runtimeProvisionKind: runtimeProvision.kind,
           recorder: input.recorder,
           provisionCoordinator,
           reuseKey,
@@ -6959,6 +7038,7 @@ async function startRuntimeServicesForWorkspaceControlInvocation(
           deferReadiness: true,
           allowFixedPortFallback,
           runtimeProvisionCommand,
+          runtimeProvisionKind: runtimeProvision.kind,
           provisionCoordinator,
           preparedProvisioning,
         },

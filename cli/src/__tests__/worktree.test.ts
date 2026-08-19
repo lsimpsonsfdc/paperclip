@@ -27,7 +27,9 @@ import {
 import {
   copyGitHooksToWorktreeGitDir,
   copySeededSecretsKey,
+  ensureEmbeddedPostgres,
   ensureWorktreeSeeded,
+  formatWorktreeSeedFailureDiagnostic,
   markWorktreeSeedPending,
   pauseSeededScheduledRoutines,
   quarantineSeededWorktreeExecutionState,
@@ -488,14 +490,62 @@ describe("worktree helpers", () => {
     expect(full.nullifyColumns).toEqual({});
   });
 
-  it("rejects a source migration journal that is ahead of the code journal", () => {
+  it("requires the seed process to own the target embedded Postgres lifecycle", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-live-target-"));
+    try {
+      fs.writeFileSync(
+        path.join(tempRoot, "postmaster.pid"),
+        `${process.pid}\n${tempRoot}\n0\n55432\n`,
+      );
+
+      await expect(ensureEmbeddedPostgres(tempRoot, 55432, { allowExisting: false }))
+        .rejects.toThrow("while it is already running");
+    } finally {
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces a credential-safe diagnostic when the target shuts down during restore", () => {
+    expect(formatWorktreeSeedFailureDiagnostic(
+      "restore",
+      new Error(
+        "Failed to restore seed.sql.gz: FATAL: the database system is shutting down; psql error: write EPIPE",
+      ),
+    )).toBe(
+      "Target embedded PostgreSQL shut down during restore. Stop any competing worktree service and retry the seed.",
+    );
+    expect(formatWorktreeSeedFailureDiagnostic("migrations", new Error("secret connection failure")))
+      .toBe("Seed failed during migrations.");
+  });
+
+  it("rejects a source migration journal that diverges from the code journal", () => {
     expect(() => resolveWorktreeSeedMigrationRevision({
       status: "upToDate",
       tableCount: 1,
       availableMigrations: ["0001_initial.sql", "0002_current.sql"],
-      appliedMigrations: ["0001_initial.sql", "0002_current.sql"],
+      appliedMigrations: ["0001_initial.sql", "0003_unknown.sql"],
       journalEntryCount: 3,
-    }, "sourcePrefix")).toThrow("Migration journal is ahead of this Paperclip checkout");
+    }, "sourcePrefix")).toThrow("Migration journal is not a prefix of this Paperclip checkout");
+  });
+
+  it("accepts a current source whose migration application order differs from filename order", () => {
+    expect(resolveWorktreeSeedMigrationRevision({
+      status: "upToDate",
+      tableCount: 1,
+      availableMigrations: [
+        "0001_initial.sql",
+        "0002_renumbered.sql",
+        "0003_applied_earlier.sql",
+        "0004_current.sql",
+      ],
+      appliedMigrations: [
+        "0001_initial.sql",
+        "0003_applied_earlier.sql",
+        "0002_renumbered.sql",
+        "0004_current.sql",
+      ],
+      journalEntryCount: 6,
+    }, "upToDate")).toBe("0004_current.sql");
   });
 
   it("accepts a source migration journal that is multiple revisions behind", () => {
@@ -508,9 +558,9 @@ describe("worktree helpers", () => {
         "0003_pending.sql",
         "0004_pending.sql",
       ],
-      appliedMigrations: ["0001_initial.sql", "0002_applied.sql"],
+      appliedMigrations: ["0002_applied.sql", "0001_initial.sql"],
       pendingMigrations: ["0003_pending.sql", "0004_pending.sql"],
-      journalEntryCount: 2,
+      journalEntryCount: 3,
       reason: "pending-migrations",
     }, "sourcePrefix")).toBe("0002_applied.sql");
   });
@@ -694,7 +744,7 @@ describe("worktree helpers", () => {
     },
   );
 
-  it("ensure-seeded keeps the pending marker when seeding fails", async () => {
+  it("ensure-seeded records a target shutdown diagnostic when restore fails", async () => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-ensure-seeded-failure-"));
     try {
       const sourceConfigPath = path.join(tempRoot, "source", "config.json");
@@ -726,13 +776,28 @@ describe("worktree helpers", () => {
       await expect(
         ensureWorktreeSeeded(
           { config: targetConfigPath, fromConfig: sourceConfigPath },
-          { seedDatabase: vi.fn().mockRejectedValue(new Error("seed failed")) },
+          {
+            seedDatabase: vi.fn(async (input) => {
+              input.onPhase?.("restore", "started");
+              throw new Error(
+                "Failed to restore seed.sql.gz: FATAL: the database system is shutting down; psql error: write EPIPE",
+              );
+            }),
+          },
         ),
-      ).rejects.toThrow("seed failed");
+      ).rejects.toThrow("database system is shutting down");
 
       expect(readWorktreeSeedManifest(targetConfigPath)).toMatchObject({
         state: "failed",
-        phase: "pending",
+        phase: "restore",
+        diagnostics: expect.arrayContaining([
+          expect.objectContaining({
+            phase: "restore",
+            status: "failed",
+            message:
+              "Target embedded PostgreSQL shut down during restore. Stop any competing worktree service and retry the seed.",
+          }),
+        ]),
       });
       expect(fs.existsSync(path.join(targetRoot, ".paperclip", "seed-pending"))).toBe(false);
       expect(fs.existsSync(path.join(targetRoot, ".paperclip", "seed-complete"))).toBe(false);
@@ -1244,7 +1309,7 @@ describe("worktree helpers", () => {
   });
 
   itEmbeddedPostgres(
-    "seeds a source whose migration journal is behind the code journal",
+    "seeds a lagging source whose migration application order differs from filename order",
     async () => {
       const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-worktree-auth-seed-"));
       const worktreeRoot = path.join(tempRoot, "PAP-999-auth-seed");
@@ -1264,7 +1329,30 @@ describe("worktree helpers", () => {
           DELETE FROM "drizzle"."__drizzle_migrations"
           WHERE "id" = (
             SELECT max("id") FROM "drizzle"."__drizzle_migrations"
+          );
+
+          WITH pair AS (
+            SELECT
+              array_agg("id" ORDER BY "id" DESC) AS ids,
+              array_agg("hash" ORDER BY "id" DESC) AS hashes
+            FROM (
+              SELECT "id", "hash"
+              FROM "drizzle"."__drizzle_migrations"
+              ORDER BY "id" DESC
+              LIMIT 2
+            ) latest
           )
+          UPDATE "drizzle"."__drizzle_migrations" migrations
+          SET "hash" = CASE
+            WHEN migrations."id" = pair.ids[1] THEN pair.hashes[2]
+            WHEN migrations."id" = pair.ids[2] THEN pair.hashes[1]
+            ELSE migrations."hash"
+          END
+          FROM pair
+          WHERE migrations."id" IN (pair.ids[1], pair.ids[2]);
+
+          INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at")
+          VALUES ('stale-unresolvable-migration-hash', 0)
         `);
         await sourceDbClient.$client.end({ timeout: 5 });
         const laggingMigrationState = await inspectMigrations(sourceDb.connectionString);
@@ -1273,7 +1361,18 @@ describe("worktree helpers", () => {
           throw new Error("Expected the source migration journal to lag the code journal");
         }
         expect(laggingMigrationState.pendingMigrations).toHaveLength(1);
-        const sourceMigrationRevision = laggingMigrationState.appliedMigrations.at(-1);
+        const expectedAppliedPrefix = laggingMigrationState.availableMigrations.slice(
+          0,
+          laggingMigrationState.appliedMigrations.length,
+        );
+        expect(laggingMigrationState.appliedMigrations).not.toEqual(expectedAppliedPrefix);
+        expect([...laggingMigrationState.appliedMigrations].sort()).toEqual(
+          [...expectedAppliedPrefix].sort(),
+        );
+        expect(laggingMigrationState.journalEntryCount).toBeGreaterThan(
+          laggingMigrationState.appliedMigrations.length,
+        );
+        const sourceMigrationRevision = expectedAppliedPrefix.at(-1);
         expect(sourceMigrationRevision).toBeTruthy();
 
         fs.mkdirSync(path.dirname(sourceKeyPath), { recursive: true });
