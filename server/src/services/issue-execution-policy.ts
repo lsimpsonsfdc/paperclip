@@ -76,6 +76,15 @@ const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
 
+/**
+ * Statuses that end the work itself. Only these may discard an armed execution
+ * gate: every other transition has to keep the gate resumable, because an
+ * armed `executionPolicy` with a null `executionState` replays from stage 0.
+ */
+function isTerminalIssueStatus(status: string | null | undefined) {
+  return status === "done" || status === "cancelled";
+}
+
 function normalizeMonitorNotes(notes: string | null | undefined) {
   if (typeof notes !== "string") return null;
   const trimmed = notes.trim();
@@ -910,17 +919,28 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       !principalsEqual(existingState?.currentParticipant ?? null, currentParticipant);
 
     if (input.allowBoardOverride && attemptedStageAdvance) {
+      // A board override must suspend the gate, not destroy it. Writing
+      // `executionState: null` while `executionPolicy` stays armed leaves no
+      // state machine running, and the next transition rebuilds the gate from
+      // stage 0 — erasing approvals that were already given. `changes_requested`
+      // already carries resume semantics: the transition below re-pends
+      // `currentStage` with `completedStageIds` intact. Terminal statuses are
+      // the one exception; there the work itself ends, so the gate ends with it
+      // (this keeps the board-cancel behaviour of #10655 unchanged).
+      const suspendedState = existingState
+        ? buildChangesRequestedState(existingState, activeStage, existingState.changesRequestedCount ?? 0)
+        : null;
+
       if (requestedStatus !== undefined && requestedStatus !== "in_review") {
-        patch.executionState = null;
+        patch.executionState = isTerminalIssueStatus(requestedStatus) ? null : suspendedState;
         return { patch };
       }
-      // Assignee-only override: the issue stays in_review, so clearing the
-      // execution state would strand it with no participant or return
-      // assignment. Re-pend the stage when the board's chosen assignee is an
-      // eligible stage participant; otherwise (unassign or a non-participant)
-      // dissolve the review — storing an ineligible participant would be
-      // silently replaced by the stage-membership repair on the next
-      // transition.
+      // Assignee-only override: the issue stays in_review, so leaving the stage
+      // pending would strand it with a participant who is not the assignee.
+      // Re-pend the stage when the board's chosen assignee is an eligible stage
+      // participant; otherwise (unassign or a non-participant) suspend the
+      // review — storing an ineligible participant would be silently replaced
+      // by the stage-membership repair on the next transition.
       if (explicitAssignee && stageHasParticipant(activeStage, explicitAssignee)) {
         buildPendingStagePatch({
           patch,
@@ -933,7 +953,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         });
         return { patch };
       }
-      patch.executionState = null;
+      patch.executionState = suspendedState;
       if (input.issue.status === "in_review") {
         patch.status = "in_progress";
       }

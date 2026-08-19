@@ -682,7 +682,7 @@ describe("issue execution policy transitions", () => {
       expect(result.decision).toBeUndefined();
     });
 
-    it("board override reassignment to a non-participant dissolves the review", () => {
+    it("board override reassignment to a non-participant suspends the review", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
           status: "in_review",
@@ -708,12 +708,18 @@ describe("issue execution policy transitions", () => {
         commentBody: "Handing the task back",
       });
 
-      expect(result.patch).toEqual({ executionState: null, status: "in_progress" });
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+        completedStageIds: [],
+      });
       expect(result.decision).toBeUndefined();
       expect(result.workflowControlledAssignment).toBeUndefined();
     });
 
-    it("board override unassignment dissolves the review instead of stranding in_review", () => {
+    it("board override unassignment suspends the review instead of stranding in_review", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
           status: "in_review",
@@ -739,9 +745,150 @@ describe("issue execution policy transitions", () => {
         commentBody: "Unassigning the reviewer",
       });
 
-      expect(result.patch).toEqual({ executionState: null, status: "in_progress" });
+      expect(result.patch.status).toBe("in_progress");
+      expect(result.patch.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: reviewStageId,
+        currentStageType: "review",
+      });
       expect(result.decision).toBeUndefined();
       expect(result.workflowControlledAssignment).toBeUndefined();
+    });
+
+    // SSO-23166 defect A. A board reassignment of an issue whose stage is
+    // pending used to write `executionState: null` while `executionPolicy`
+    // stayed armed. The next transition then rebuilt the gate from stage 0 and
+    // erased every approval already given. Introduced upstream by 0f12721e
+    // (PR #10655); reached this fork on 2026-08-15 via merge 57edb26d.
+    describe("board reassignment of a pending stage (SSO-23166)", () => {
+      const fourStagePolicy = makePolicy([
+        { type: "review", participants: [{ type: "agent", agentId: qaAgentId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: ctoAgentId }] },
+        { type: "approval", participants: [{ type: "user", userId: boardUserId }] },
+        { type: "approval", participants: [{ type: "agent", agentId: qaAgentId }] },
+      ]);
+      const stageIds = fourStagePolicy.stages.map((stage) => stage.id);
+      // A second board member, deliberately not a participant of any stage: a
+      // status change from the participant themselves is a stage decision, not
+      // an override, and is handled by the participant branch above.
+      const otherBoardUserId = "other-board-user";
+
+      /** Stage 2 pending with the board user, stages 0 and 1 already approved. */
+      const pendingStageTwo = (): IssueExecutionState => ({
+        status: "pending",
+        currentStageId: stageIds[2],
+        currentStageIndex: 2,
+        currentStageType: "approval",
+        currentParticipant: { type: "user", userId: boardUserId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [stageIds[0], stageIds[1]],
+        lastDecisionId: null,
+        lastDecisionOutcome: "approved",
+      });
+
+      const overrideResult = () =>
+        applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: null,
+            assigneeUserId: boardUserId,
+            executionPolicy: fourStagePolicy,
+            executionState: pendingStageTwo(),
+          },
+          policy: fourStagePolicy,
+          // The operator's most natural action on an issue in their queue with
+          // nothing to click: hand it to somebody. No status field is sent.
+          requestedAssigneePatch: { assigneeAgentId: coderAgentId, assigneeUserId: null },
+          actor: { userId: boardUserId },
+          allowBoardOverride: true,
+        });
+
+      it("suspends the gate instead of clearing it", () => {
+        const result = overrideResult();
+
+        expect(result.patch.status).toBe("in_progress");
+        expect(result.patch.executionState).not.toBeNull();
+        expect(result.patch.executionState).toMatchObject({
+          status: "changes_requested",
+          currentStageId: stageIds[2],
+          currentStageIndex: 2,
+          currentStageType: "approval",
+          completedStageIds: [stageIds[0], stageIds[1]],
+        });
+      });
+
+      it("resumes the same stage on the next in_review transition, not stage 0", () => {
+        const suspended = parseIssueExecutionState(overrideResult().patch.executionState);
+
+        const resumed = applyIssueExecutionPolicyTransition({
+          issue: {
+            status: "in_progress",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: fourStagePolicy,
+            executionState: suspended,
+          },
+          policy: fourStagePolicy,
+          requestedStatus: "in_review",
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+        });
+
+        expect(resumed.patch.executionState).toMatchObject({
+          status: "pending",
+          currentStageId: stageIds[2],
+          currentStageIndex: 2,
+          currentParticipant: { type: "user", userId: boardUserId },
+          completedStageIds: [stageIds[0], stageIds[1]],
+        });
+      });
+
+      it("still clears the gate when the board ends the work outright", () => {
+        for (const requestedStatus of ["done", "cancelled"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_review",
+              assigneeAgentId: null,
+              assigneeUserId: boardUserId,
+              executionPolicy: fourStagePolicy,
+              executionState: pendingStageTwo(),
+            },
+            policy: fourStagePolicy,
+            requestedStatus,
+            requestedAssigneePatch: {},
+            actor: { userId: otherBoardUserId },
+            allowBoardOverride: true,
+            commentBody: "Closing this out",
+          });
+
+          expect(result.patch.executionState).toBeNull();
+        }
+      });
+
+      it("never leaves an armed policy with a null state on a non-terminal override", () => {
+        for (const requestedStatus of ["todo", "in_progress", "blocked"] as const) {
+          const result = applyIssueExecutionPolicyTransition({
+            issue: {
+              status: "in_review",
+              assigneeAgentId: null,
+              assigneeUserId: boardUserId,
+              executionPolicy: fourStagePolicy,
+              executionState: pendingStageTwo(),
+            },
+            policy: fourStagePolicy,
+            requestedStatus,
+            requestedAssigneePatch: {},
+            actor: { userId: otherBoardUserId },
+            allowBoardOverride: true,
+            commentBody: "Parking this",
+          });
+
+          expect(result.patch.executionState, `status=${requestedStatus}`).not.toBeNull();
+          expect(result.patch.executionState, `status=${requestedStatus}`).toMatchObject({
+            completedStageIds: [stageIds[0], stageIds[1]],
+          });
+        }
+      });
     });
 
     it("non-participant can still post non-advancing updates", () => {

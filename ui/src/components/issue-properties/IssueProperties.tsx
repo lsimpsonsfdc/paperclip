@@ -97,6 +97,7 @@ import { issueReviewPolicyBadge } from "../../lib/review-policy";
 import { IssueCasesPanel } from "../IssueCasesPanel";
 import { ExpandRelationListButton, RemovableIssueReferencePill } from "./relation-controls";
 import { Badge } from "@/components/ui/badge";
+import { StalledReviewActions } from "@/components/StalledReviewActions";
 
 function TruncatedCopyable({ value, icon: Icon }: { value: string; icon: ComponentType<{ className?: string }> }) {
   const [copied, setCopied] = useState(false);
@@ -886,6 +887,12 @@ export function IssueProperties({
       </button>
     </PropertyRow>
   );
+  const pendingStageIsMine =
+    issue.status === "in_review" &&
+    issue.executionState?.status === "pending" &&
+    issue.executionState.currentParticipant?.type === "user" &&
+    !!currentUserId &&
+    issue.executionState.currentParticipant.userId === currentUserId;
   const currentExecutionLabel = (() => {
     if (!issue.executionState?.currentStageType) return null;
     const stageLabel = issue.executionState.currentStageType === "review" ? "Review" : "Approval";
@@ -2371,6 +2378,24 @@ export function IssueProperties({
         {currentExecutionLabel && (
           <PropertyRow label="Execution">
             <span className="text-sm truncate min-w-0" title={currentExecutionLabel}>{currentExecutionLabel}</span>
+          </PropertyRow>
+        )}
+
+        {/*
+          A stage pending with *you* needs a control, not a label: the status
+          picker sends a bare status PATCH, which the stage machine rejects
+          because an approval decision must carry its comment in the same
+          request. These are the same verbs the decisions queue shows, against
+          the same endpoint.
+        */}
+        {pendingStageIsMine && (
+          <PropertyRow label="">
+            <StalledReviewActions
+              issueId={issue.id}
+              companyId={issue.companyId}
+              reviewPolicy={issue.reviewPolicy}
+              className="min-w-0"
+            />
           </PropertyRow>
         )}
 

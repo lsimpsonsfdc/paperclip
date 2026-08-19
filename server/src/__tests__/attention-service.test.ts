@@ -224,6 +224,39 @@ describeEmbeddedPostgres("attention service", () => {
     };
   }
 
+  // SSO-23166 defect B. A stage pending with a user raises no interaction,
+  // approval or monitor card, so without inline verbs the operator has nothing
+  // to act on and the only exit left is a bare status PATCH that the stage
+  // machine rejects for carrying no decision comment.
+  it("marks a review pending with a human participant inline resolvable", async () => {
+    const { companyId, workerId } = await seedCompany("ATP");
+    const humanStageIssueId = await insertIssue({
+      companyId,
+      identifier: "ATP-1",
+      title: "Approval pending with the operator",
+      status: "in_review",
+      assigneeUserId: "board-user",
+      executionState: pendingUserExecutionState("board-user"),
+    });
+    const agentStageIssueId = await insertIssue({
+      companyId,
+      identifier: "ATP-2",
+      title: "Approval pending with an agent",
+      status: "in_review",
+      assigneeAgentId: workerId,
+      executionState: pendingAgentExecutionState(workerId),
+    });
+
+    const feed = await attentionService(db).list(companyId, { userId: "board-user" });
+    const humanItem = feed.items.find((item) => item.subject.id === humanStageIssueId);
+    const agentItem = feed.items.find((item) => item.subject.id === agentStageIssueId);
+
+    expect(humanItem?.inlineResolvable).toBe(true);
+    expect(humanItem?.decisionVerbs.map((verb) => verb.id)).toEqual(["approve", "request_changes"]);
+    // An agent participant is woken directly, so its row stays a deep link.
+    expect(agentItem?.inlineResolvable ?? false).toBe(false);
+  });
+
   it("excludes internal harness reviews from items, counts, and decision queues", async () => {
     const { companyId, workerId } = await seedCompany("ATH");
     const harnessIssueId = await insertIssue({

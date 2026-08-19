@@ -1703,7 +1703,12 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
                 { id: "approve", label: "Approve", description: "Approve the review and advance the issue." },
                 { id: "request_changes", label: "Request changes", description: "Return the issue to the assignee with changes requested." },
               ),
-          inlineResolvable: stalled,
+          // A pending stage held by a user raises no interaction, approval or
+          // monitor card, so without inline verbs the human has nothing to act
+          // on and the only exit left is a bare status PATCH the stage machine
+          // rejects. Resolve it in-row, exactly like a stalled review. A linked
+          // approval still deep-links — that card is the real action there.
+          inlineResolvable: stalled || (hasHumanParticipant && !pendingApprovalId),
           entryRule: stalled
             ? "issues.status = 'in_review' and reviewAttention.state = 'stalled'."
             : "issues.status = 'in_review' and human reviewer, user assignee, or linked pending approval exists.",

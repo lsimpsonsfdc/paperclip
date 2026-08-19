@@ -14,6 +14,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueComments,
+  issueExecutionDecisions,
   issueInboxArchives,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -51,6 +52,7 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(issueComments);
+    await db.delete(issueExecutionDecisions);
     await db.delete(issueRecoveryActions);
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
@@ -622,5 +624,125 @@ describeEmbeddedPostgres("stalled review decision routes", () => {
       request(app(actor)).post(`/api/issues/${raceIssueId}/stalled-review-decision`).send({ action: "approve" }),
     ]);
     expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
+  });
+  // SSO-23166 defect B. A stage whose participant is a user assigns the issue
+  // and raises nothing the human can act on: `buildExecutionStageWakeup` only
+  // wakes agent participants, and this endpoint used to 409 anything that was
+  // not "stalled" — which a pending stage never is, because it has a
+  // participant. The pending participant is now admitted here, so the shipped
+  // review UI can resolve the stage.
+  describe("pending user-participant stage (SSO-23166)", () => {
+    async function seedUserStage(input: {
+      companyId: string;
+      assigneeAgentId: string;
+      participantUserId: string;
+      identifier: string;
+    }) {
+      const issueId = randomUUID();
+      const reviewStageId = randomUUID();
+      const approvalStageId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId: input.companyId,
+        identifier: input.identifier,
+        title: input.identifier,
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: null,
+        assigneeUserId: input.participantUserId,
+        executionPolicy: {
+          stages: [
+            { id: reviewStageId, type: "review", participants: [{ type: "agent", agentId: input.assigneeAgentId }] },
+            { id: approvalStageId, type: "approval", participants: [{ type: "user", userId: input.participantUserId }] },
+          ],
+        },
+        executionState: {
+          status: "pending",
+          currentStageId: approvalStageId,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: input.participantUserId },
+          returnAssignee: { type: "agent", agentId: input.assigneeAgentId },
+          completedStageIds: [reviewStageId],
+          lastDecisionId: null,
+          lastDecisionOutcome: "approved",
+        },
+      });
+      return { issueId, reviewStageId, approvalStageId };
+    }
+
+    it("lets the pending user participant approve the stage and records the decision", async () => {
+      const seeded = await seedCompany("PUP");
+      const { issueId, approvalStageId } = await seedUserStage({
+        companyId: seeded.companyId,
+        assigneeAgentId: seeded.assigneeAgentId,
+        participantUserId: seeded.memberUserId,
+        identifier: "PUP-1",
+      });
+
+      const response = await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+        .post(`/api/issues/${issueId}/stalled-review-decision`)
+        .send({ action: "approve", note: "Looks good to me." })
+        .expect(200);
+
+      expect(response.body.issue.status).toBe("done");
+
+      // The decision goes through the stage machine, so it leaves an audit row
+      // carrying the operator's own note — not a bare status write.
+      const decisions = await db
+        .select()
+        .from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.issueId, issueId));
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({
+        stageId: approvalStageId,
+        stageType: "approval",
+        outcome: "approved",
+        actorUserId: seeded.memberUserId,
+        actorAgentId: null,
+        body: "Looks good to me.",
+      });
+    });
+
+    it("keeps the stage resumable when the participant requests changes", async () => {
+      const seeded = await seedCompany("PUQ");
+      const { issueId, reviewStageId, approvalStageId } = await seedUserStage({
+        companyId: seeded.companyId,
+        assigneeAgentId: seeded.assigneeAgentId,
+        participantUserId: seeded.memberUserId,
+        identifier: "PUQ-1",
+      });
+
+      await request(app(boardActor(seeded.companyId, seeded.memberUserId)))
+        .post(`/api/issues/${issueId}/stalled-review-decision`)
+        .send({ action: "request_changes", note: "Please add a runbook." })
+        .expect(200);
+
+      const stored = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]);
+      expect(stored.status).not.toBe("in_review");
+      // Suspended, not destroyed: the completed review stage survives, so the
+      // gate resumes at the approval stage rather than replaying from stage 0.
+      expect(stored.executionState).toMatchObject({
+        status: "changes_requested",
+        currentStageId: approvalStageId,
+        completedStageIds: [reviewStageId],
+      });
+      expect(stored.assigneeAgentId).toBe(seeded.assigneeAgentId);
+    });
+
+    it("still refuses a board member who is not the pending participant", async () => {
+      const seeded = await seedCompany("PUR");
+      const { issueId } = await seedUserStage({
+        companyId: seeded.companyId,
+        assigneeAgentId: seeded.assigneeAgentId,
+        participantUserId: seeded.memberUserId,
+        identifier: "PUR-1",
+      });
+
+      await request(app(boardActor(seeded.companyId, seeded.peerUserId)))
+        .post(`/api/issues/${issueId}/stalled-review-decision`)
+        .send({ action: "approve", note: "Not mine to give." })
+        .expect(409);
+    });
   });
 });

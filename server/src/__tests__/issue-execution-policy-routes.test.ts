@@ -964,7 +964,14 @@ describe("issue execution policy routes", () => {
     expect(res.status).toBe(200);
     const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(updatePatch.status).toBe("in_progress");
-    expect(updatePatch.executionState).toBeNull();
+    // The gate is suspended, not destroyed (SSO-23166): an armed policy with a
+    // null state replays every completed stage from index 0 on the next
+    // transition, erasing approvals that were already given.
+    expect(updatePatch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: "11111111-1111-4111-8111-111111111111",
+      currentStageType: "review",
+    });
     expect(updatePatch.assigneeAgentId).toBe("55555555-5555-4555-8555-555555555555");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
