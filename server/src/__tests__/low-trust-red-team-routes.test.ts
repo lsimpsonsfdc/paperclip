@@ -28,6 +28,7 @@ import {
   issueApprovals,
   issueComments,
   issueDocuments,
+  issueInboxArchives,
   issueRelations,
   issues,
   issueThreadInteractions,
@@ -41,6 +42,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { parseWakePayloadFromMessage } from "./helpers/wake-message.js";
+import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { issueRoutes } from "../routes/issues.js";
@@ -77,29 +79,6 @@ function isHeartbeatCleanupFkError(error: unknown) {
     message.includes("activity_log_run_id_heartbeat_runs_id_fk") ||
     message.includes("heartbeat_runs_wakeup_request_id_agent_wakeup_requests_id_fk")
   );
-}
-
-// Await every background heartbeat run until the run table is quiescent. A route
-// dispatches a wakeup fire-and-forget (void heartbeat.wakeup(...) in
-// routes/issues.ts). Such a wakeup, or a run it dispatches, can write issues,
-// issue_comments, and heartbeat_runs rows during teardown and race the deletes
-// below (a heartbeat_runs delete deadlocks on the ON DELETE SET NULL cascade to
-// issues; an issue_comments insert breaks the later delete of issues).
-// drainActiveRunExecutions() awaits both in-flight wakeup promises and in-flight
-// run executions, so it now also waits for a wakeup that is still before run
-// registration. Re-check the run table after the drain as a backstop, and give a
-// late run a macrotask before the next attempt, until no run is queued or running.
-async function drainHeartbeatRunsToQuiescence(
-  db: Db,
-  heartbeat: ReturnType<typeof heartbeatService>,
-) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    await heartbeat.drainActiveRunExecutions();
-    const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
-    const hasPending = runs.some((run) => run.status === "queued" || run.status === "running");
-    if (!hasPending) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
 }
 
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
@@ -745,6 +724,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     await db.delete(documents);
     await db.delete(issueComments);
     await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
     await db.delete(activityLog);
     await db.delete(heartbeatRunEvents);
     await deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db);
@@ -806,7 +786,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
     });
   });
 
-  it("allows only standard checked-out runs to comment one hop upward", async () => {
+  it("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
     const fixture = await seedLowTrustFixture(db);
     const standardApp = createApp(db, standardReportActor(fixture));
     const lowTrustApp = createApp(db, agentActor(fixture));
@@ -830,24 +810,30 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       .send({ body: "Contained report must not cross" });
     expect(lowTrustParentComment.status, JSON.stringify(lowTrustParentComment.body)).toBe(403);
 
-    const forbiddenStandardWrites = [
+    const defaultOpenComments = [
       request(standardApp)
         .post(`/api/issues/${fixture.issues.reviewGrandparent.id}/comments`)
-        .send({ body: "No grandparent report" }),
+        .send({ body: "Visible grandparent context" }),
       request(standardApp)
         .post(`/api/issues/${fixture.issues.sameBoundaryChild.id}/comments`)
-        .send({ body: "No sibling report" }),
-      request(standardApp)
-        .patch(`/api/issues/${fixture.issues.reviewRoot.id}`)
-        .send({ status: "blocked" }),
-      request(standardApp)
-        .put(`/api/issues/${fixture.issues.reviewRoot.id}/documents/upward-write`)
-        .send({ format: "markdown", body: "No upward document write" }),
+        .send({ body: "Visible sibling context" }),
     ];
-    for (const forbiddenWrite of forbiddenStandardWrites) {
-      const response = await forbiddenWrite;
-      expect(response.status, JSON.stringify(response.body)).toBe(403);
+    for (const defaultOpenComment of defaultOpenComments) {
+      const response = await defaultOpenComment;
+      expect(response.status, JSON.stringify(response.body)).toBe(201);
     }
+
+    const checkedOutPeerUpdate = await request(standardApp)
+      .patch(`/api/issues/${fixture.issues.reviewRoot.id}`)
+      .send({ status: "blocked" });
+    expect(checkedOutPeerUpdate.status, JSON.stringify(checkedOutPeerUpdate.body)).toBe(409);
+    expect(checkedOutPeerUpdate.body.details.code).toBe("issue_write_assignee_run_lock");
+
+    const documentWrite = await request(standardApp)
+      .put(`/api/issues/${fixture.issues.reviewRoot.id}/documents/upward-write`)
+      .send({ format: "markdown", body: "No upward document write" });
+    expect(documentWrite.status, JSON.stringify(documentWrite.body)).toBe(409);
+    expect(documentWrite.body.details.code).toBe("issue_write_assignee_run_lock");
 
     for (const closedParent of [
       { assigneeAgentId: null, intent: { reopen: true } },
@@ -986,7 +972,7 @@ describeEmbeddedPostgres("low-trust red-team HTTP route regression suite", () =>
       .post(`/api/issues/${targetIssue!.id}/comments`)
       .send({ body: "I was not mentioned." });
     expect(unmentionedComment.status, JSON.stringify(unmentionedComment.body)).toBe(403);
-    expect(unmentionedComment.body.error).toBe("Issue is outside this actor's authorization boundary");
+    expect(unmentionedComment.body.details.code).toBe("issue_write_actor_class_excluded");
   });
 
   it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
